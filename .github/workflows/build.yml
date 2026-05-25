@@ -27,6 +27,9 @@ jobs:
           cp -r sdks-master/iPhoneOS16.5.sdk .
           rm -rf sdks-master master.zip
 
+      - name: Install ldid
+        run: brew install ldid
+
       - name: Build
         run: |
           export THEOS=$HOME/theos
