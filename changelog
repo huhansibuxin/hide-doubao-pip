@@ -1,0 +1,10 @@
+HideDoubaoPiP v2
+
+主要作用：仅隐藏豆包输入法创建的 PiP 悬浮窗，保留 Bilibili、微信等正常视频 PiP。
+
+相对最早 v2 的主要变化：
+- 移除宽泛的 SBPIPPegasusAdapter 匹配，避免误隐藏正常视频 PiP。
+- 增加豆包输入法 bundle/process 识别，并在 bundle 为空时使用保守的多信号 PiP 视图特征判断。
+- 不再使用 hidden=YES 破坏系统 PiP 状态机，仅透明化窗口并禁用交互。
+- 增加 PiP 内部布局触发点，解决复用 PiP 容器后悬浮窗重新出现的问题。
+- release 版本不写日志文件，debug 版本保留 /var/mobile/Documents/PiPArrowHide.log 便于排查。
