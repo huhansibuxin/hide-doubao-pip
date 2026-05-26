@@ -140,6 +140,28 @@ static DoubaoPiPIdentity IdentityFromPiPController(id pipCtrl) {
     return IdentityFromPegasusApp(pipCtrl);
 }
 
+static BOOL IsDoubaoPegasusController(id pegasus) {
+    if (!pegasus) return NO;
+    if (![SafeClassName(pegasus) isEqualToString:@"PGPictureInPictureController"]) return NO;
+    
+    id activeApp = SafeKVC(pegasus, @"_activePictureInPictureApplication");
+    if (activeApp) {
+        id bundleID = SafeKVC(activeApp, @"_bundleIdentifier");
+        return IsDoubaoBundleID(bundleID);
+    }
+    
+    // 回退：检查所有 application 字典
+    id apps = SafeKVC(pegasus, @"_pictureInPictureApplications");
+    if ([apps isKindOfClass:[NSArray class]]) {
+        for (id app in (NSArray *)apps) {
+            if (IsDoubaoBundleID(SafeKVC(app, @"_bundleIdentifier"))) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
 static BOOL IsDoubaoPiPController(id pipCtrl) {
     return IdentityFromPiPController(pipCtrl) == DoubaoPiPIdentityDoubao;
 }
@@ -285,61 +307,9 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     if (rvc) {
         id pipCtrl = SafeKVC(rvc, @"_pipController");
         if (IsDoubaoPiPController(pipCtrl)) {
-            // 方案1: 尝试设置内部 stashed 标志
-            id adapter = SafeKVC(pipCtrl, @"_adapter");
-            if (adapter) {
-                id pegasus = SafeKVC(adapter, @"_pegasusController");
-                if (pegasus) {
-                    WriteLog(@"[STASH] Attempting to set stashed flags for reason=%@", reason);
-                    
-                    // 尝试设置 Pegasus 的 stashed 标志
-                    @try {
-                        [pegasus setValue:@YES forKey:@"_stashed"];
-                        WriteLog(@"[STASH] Set _stashed=YES on pegasus");
-                    } @catch (NSException *e) {}
-                    
-                    @try {
-                        [pegasus setValue:@YES forKey:@"stashed"];
-                        WriteLog(@"[STASH] Set stashed=YES on pegasus");
-                    } @catch (NSException *e) {}
-                    
-                    // 尝试调用 stash 方法
-                    SEL stashSels[] = {
-                        NSSelectorFromString(@"stashPictureInPicture"),
-                        NSSelectorFromString(@"_stashPictureInPicture"),
-                        NSSelectorFromString(@"_stash"),
-                        NSSelectorFromString(@"stash")
-                    };
-                    
-                    for (int i = 0; i < 4; i++) {
-                        if ([pegasus respondsToSelector:stashSels[i]]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                            [pegasus performSelector:stashSels[i]];
-#pragma clang diagnostic pop
-                            WriteLog(@"[STASH] Called selector %d successfully", i);
-                        }
-                    }
-                }
-            }
-            
-            // 方案2: 直接设置 SBPIPController 的 stashed 标志
-            @try {
-                [pipCtrl setValue:@YES forKey:@"_stashed"];
-                WriteLog(@"[STASH] Set _stashed=YES on pipController");
-            } @catch (NSException *e) {}
-            
-            @try {
-                [pipCtrl setValue:@YES forKey:@"stashed"];
-                WriteLog(@"[STASH] Set stashed=YES on pipController");
-            } @catch (NSException *e) {}
-            
-            // 方案3: 设置窗口位置到屏幕外
-            CGRect screenBounds = [[UIScreen mainScreen] bounds];
-            CGRect offscreenFrame = CGRectMake(-screenBounds.size.width, 0, window.frame.size.width, window.frame.size.height);
-            if (!CGRectEqualToRect(window.frame, offscreenFrame)) {
-                window.frame = offscreenFrame;
-                WriteLog(@"[STASH] Moved window offscreen to x=%f", offscreenFrame.origin.x);
+            pid_t pid = GetDoubaoPid(pipCtrl);
+            if (pid > 0) {
+                AcquireExtraAssertion(pid);
             }
         }
     }
@@ -354,15 +324,10 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
         window.userInteractionEnabled = NO;
         changed = YES;
     }
-
-    if (rvc) {
-        id pipCtrl = SafeKVC(rvc, @"_pipController");
-        if (IsDoubaoPiPController(pipCtrl)) {
-            pid_t pid = GetDoubaoPid(pipCtrl);
-            if (pid > 0) {
-                AcquireExtraAssertion(pid);
-            }
-        }
+    // 关键：真正隐藏窗口，不只是透明
+    if (!window.hidden) {
+        window.hidden = YES;
+        changed = YES;
     }
 
     if (changed) {
@@ -374,6 +339,53 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
     if (!view) return;
     HideDoubaoWindow(view.window, reason);
 }
+
+@interface PGPictureInPictureController : NSObject
+@end
+
+%hook PGPictureInPictureController
+
+- (BOOL)isStashed {
+    if (IsDoubaoPegasusController(self)) {
+        WriteLog(@"[LIE] isStashed returning YES for Doubao PiP");
+        return YES;
+    }
+    return %orig;
+}
+
+- (BOOL)_isStashed {
+    if (IsDoubaoPegasusController(self)) {
+        WriteLog(@"[LIE] _isStashed returning YES for Doubao PiP");
+        return YES;
+    }
+    return %orig;
+}
+
+- (BOOL)isPictureInPictureActive {
+    if (IsDoubaoPegasusController(self)) {
+        WriteLog(@"[LIE] isPictureInPictureActive returning NO for Doubao PiP");
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)isPictureInPictureVisible {
+    if (IsDoubaoPegasusController(self)) {
+        WriteLog(@"[LIE] isPictureInPictureVisible returning NO for Doubao PiP");
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)isPictureInPictureWindowVisible {
+    if (IsDoubaoPegasusController(self)) {
+        WriteLog(@"[LIE] isPictureInPictureWindowVisible returning NO for Doubao PiP");
+        return NO;
+    }
+    return %orig;
+}
+
+%end
 
 @interface SBPictureInPictureWindow : UIWindow
 @end
@@ -407,6 +419,28 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
     if (!hidden) {
         HideDoubaoWindow(self, @"setHidden");
     }
+}
+
+// 关键：让系统认为这个窗口不在屏幕上
+- (BOOL)isKeyWindow {
+    if (IsDoubaoPiPWindow(self)) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)isOnScreen {
+    if (IsDoubaoPiPWindow(self)) {
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)_isVisible {
+    if (IsDoubaoPiPWindow(self)) {
+        return NO;
+    }
+    return %orig;
 }
 
 %end
@@ -492,5 +526,5 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v0.0.7 with enhanced stash and idle timer blocking");
+    WriteLog(@"[INIT] HideDoubaoPiP v0.0.7 state lying + window offscreen");
 }
