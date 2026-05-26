@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = HideDoubaoPiP
 HideDoubaoPiP_FILES = Tweak.xm
-HideDoubaoPiP_FRAMEWORKS = UIKit Foundation CoreGraphics
+HideDoubaoPiP_FRAMEWORKS = UIKit Foundation
 HideDoubaoPiP_CFLAGS = -fobjc-arc
 
 include $(THEOS_MAKE_PATH)/tweak.mk
