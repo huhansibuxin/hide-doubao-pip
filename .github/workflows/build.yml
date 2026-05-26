@@ -41,3 +41,5 @@ jobs:
         with:
           name: HideDoubaoPiP-deb
           path: packages/*.deb
+          retention-days: 7
+          if-no-files-found: error
