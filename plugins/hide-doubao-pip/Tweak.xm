@@ -300,6 +300,45 @@ static void AcquireExtraAssertion(pid_t pid) {
     }
 }
 
+// 新方法：直接调用 PiP 的 stop 方法，让系统认为 PiP 已关闭
+static void StopDoubaoPiP(id pipCtrl) {
+    if (!pipCtrl) return;
+    
+    // 尝试调用 stop 相关方法
+    SEL stopSels[] = {
+        NSSelectorFromString(@"stopPictureInPicture"),
+        NSSelectorFromString(@"_stopPictureInPicture"),
+        NSSelectorFromString(@"stop"),
+        NSSelectorFromString(@"_stop")
+    };
+    
+    for (int i = 0; i < 4; i++) {
+        if ([pipCtrl respondsToSelector:stopSels[i]]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            [pipCtrl performSelector:stopSels[i]];
+#pragma clang diagnostic pop
+            WriteLog(@"[STOP] Called selector %d to stop Doubao PiP", i);
+            return;
+        }
+    }
+    
+    // 如果 stop 方法不存在，尝试通过 adapter 调用
+    id adapter = SafeKVC(pipCtrl, @"_adapter");
+    if (adapter) {
+        for (int i = 0; i < 4; i++) {
+            if ([adapter respondsToSelector:stopSels[i]]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+                [adapter performSelector:stopSels[i]];
+#pragma clang diagnostic pop
+                WriteLog(@"[STOP] Called selector %d on adapter to stop Doubao PiP", i);
+                return;
+            }
+        }
+    }
+}
+
 static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     if (!window || !IsDoubaoPiPWindow(window)) return;
 
@@ -307,6 +346,9 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     if (rvc) {
         id pipCtrl = SafeKVC(rvc, @"_pipController");
         if (IsDoubaoPiPController(pipCtrl)) {
+            // 新方法：尝试停止 PiP，让系统认为它已关闭
+            StopDoubaoPiP(pipCtrl);
+            
             pid_t pid = GetDoubaoPid(pipCtrl);
             if (pid > 0) {
                 AcquireExtraAssertion(pid);
@@ -328,6 +370,13 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     if (!window.hidden) {
         window.hidden = YES;
         changed = YES;
+    }
+    
+    // 将窗口层级降到后台级别
+    if (window.windowLevel > -1000.0) {
+        window.windowLevel = -1000.0;
+        changed = YES;
+        WriteLog(@"[WINDOW] Set windowLevel to -1000.0 for Doubao PiP");
     }
 
     if (changed) {
@@ -582,5 +631,5 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v0.0.9 - SBApplication/SBProcess state lying");
+    WriteLog(@"[INIT] HideDoubaoPiP v0.1.0 - stop PiP to allow system sleep");
 }
