@@ -146,8 +146,35 @@ static BOOL IsDoubaoPiPWindow(UIWindow *window) {
 
 static void HideDoubaoWindow(UIWindow *window) {
     if (!window || !IsDoubaoPiPWindow(window)) return;
-    window.alpha = 0.0;
-    window.userInteractionEnabled = NO;
+    
+    // 先尝试触发挂起（滑到左侧边缘）
+    UIViewController *rvc = window.rootViewController;
+    if (rvc) {
+        id pipCtrl = SafeKVC(rvc, @"_pipController");
+        if (pipCtrl) {
+            id adapter = SafeKVC(pipCtrl, @"_adapter");
+            if (adapter) {
+                id pegasus = SafeKVC(adapter, @"_pegasusController");
+                if (pegasus) {
+                    // 尝试多个可能的 stash selector
+                    NSArray *candidates = @[@"stashPictureInPicture", @"_stashPictureInPicture", @"_stash"];
+                    for (NSString *selName in candidates) {
+                        SEL sel = NSSelectorFromString(selName);
+                        if ([pegasus respondsToSelector:sel]) {
+                            [pegasus performSelector:sel];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 等待挂起动画完成后再隐藏
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        window.alpha = 0.0;
+        window.userInteractionEnabled = NO;
+    });
 }
 
 static void HideDoubaoWindowForView(UIView *view) {
