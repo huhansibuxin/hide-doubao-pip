@@ -281,65 +281,70 @@ static void AcquireExtraAssertion(pid_t pid) {
 static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     if (!window || !IsDoubaoPiPWindow(window)) return;
 
-    // 先尝试 stash 到左侧边缘
     UIViewController *rvc = window.rootViewController;
     if (rvc) {
         id pipCtrl = SafeKVC(rvc, @"_pipController");
         if (IsDoubaoPiPController(pipCtrl)) {
-            // 获取 Pegasus 控制器
+            // 方案1: 尝试设置内部 stashed 标志
             id adapter = SafeKVC(pipCtrl, @"_adapter");
             if (adapter) {
                 id pegasus = SafeKVC(adapter, @"_pegasusController");
                 if (pegasus) {
-                    WriteLog(@"[STASH] Attempting stash for reason=%@", reason);
+                    WriteLog(@"[STASH] Attempting to set stashed flags for reason=%@", reason);
                     
-                    // 尝试调用 stash 相关方法
+                    // 尝试设置 Pegasus 的 stashed 标志
+                    @try {
+                        [pegasus setValue:@YES forKey:@"_stashed"];
+                        WriteLog(@"[STASH] Set _stashed=YES on pegasus");
+                    } @catch (NSException *e) {}
+                    
+                    @try {
+                        [pegasus setValue:@YES forKey:@"stashed"];
+                        WriteLog(@"[STASH] Set stashed=YES on pegasus");
+                    } @catch (NSException *e) {}
+                    
+                    // 尝试调用 stash 方法
                     SEL stashSels[] = {
                         NSSelectorFromString(@"stashPictureInPicture"),
                         NSSelectorFromString(@"_stashPictureInPicture"),
-                        NSSelectorFromString(@"_stash")
+                        NSSelectorFromString(@"_stash"),
+                        NSSelectorFromString(@"stash")
                     };
                     
-                    for (int i = 0; i < 3; i++) {
+                    for (int i = 0; i < 4; i++) {
                         if ([pegasus respondsToSelector:stashSels[i]]) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                             [pegasus performSelector:stashSels[i]];
 #pragma clang diagnostic pop
                             WriteLog(@"[STASH] Called selector %d successfully", i);
-                            break;
                         }
                     }
-                    
-                    // 等待动画完成（0.7秒）
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        BOOL changed = NO;
-                        if (window.alpha != 0.0) {
-                            window.alpha = 0.0;
-                            changed = YES;
-                        }
-                        if (window.userInteractionEnabled) {
-                            window.userInteractionEnabled = NO;
-                            changed = YES;
-                        }
-                        
-                        if (changed) {
-                            WriteLog(@"[WINDOW] Transparent Doubao PiP window after stash reason=%@", reason);
-                        }
-                        
-                        // 保活机制
-                        pid_t pid = GetDoubaoPid(pipCtrl);
-                        if (pid > 0) {
-                            AcquireExtraAssertion(pid);
-                        }
-                    });
-                    return; // 提前返回，等待动画完成
                 }
+            }
+            
+            // 方案2: 直接设置 SBPIPController 的 stashed 标志
+            @try {
+                [pipCtrl setValue:@YES forKey:@"_stashed"];
+                WriteLog(@"[STASH] Set _stashed=YES on pipController");
+            } @catch (NSException *e) {}
+            
+            @try {
+                [pipCtrl setValue:@YES forKey:@"stashed"];
+                WriteLog(@"[STASH] Set stashed=YES on pipController");
+            } @catch (NSException *e) {}
+            
+            // 方案3: 设置窗口位置到屏幕外
+            CGRect screenBounds = [[UIScreen mainScreen] bounds];
+            CGRect offscreenFrame = CGRectMake(-screenBounds.size.width, 0, window.frame.size.width, window.frame.size.height);
+            if (!CGRectEqualToRect(window.frame, offscreenFrame)) {
+                window.frame = offscreenFrame;
+                WriteLog(@"[STASH] Moved window offscreen to x=%f", offscreenFrame.origin.x);
             }
         }
     }
     
-    // 如果 stash 逻辑失败，回退到直接隐藏
+    // 隐藏窗口
     BOOL changed = NO;
     if (window.alpha != 0.0) {
         window.alpha = 0.0;
@@ -452,8 +457,40 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
     %orig;
 }
 
+- (void)_acquireIdleTimerDisableAssertion {
+    if (IsDoubaoPiPController(self)) {
+        WriteLog(@"[KEEPALIVE] Blocked _acquireIdleTimerDisableAssertion for Doubao PiP");
+        return;
+    }
+    %orig;
+}
+
+- (void)_updateIdleTimer {
+    if (IsDoubaoPiPController(self)) {
+        WriteLog(@"[KEEPALIVE] Blocked _updateIdleTimer for Doubao PiP");
+        return;
+    }
+    %orig;
+}
+
+- (void)_resetIdleTimer {
+    if (IsDoubaoPiPController(self)) {
+        WriteLog(@"[KEEPALIVE] Blocked _resetIdleTimer for Doubao PiP");
+        return;
+    }
+    %orig;
+}
+
+- (void)_resetIdleTimerForReason:(id)reason {
+    if (IsDoubaoPiPController(self)) {
+        WriteLog(@"[KEEPALIVE] Blocked _resetIdleTimerForReason for Doubao PiP");
+        return;
+    }
+    %orig;
+}
+
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v0.0.6 with stash support");
+    WriteLog(@"[INIT] HideDoubaoPiP v0.0.7 with enhanced stash and idle timer blocking");
 }
