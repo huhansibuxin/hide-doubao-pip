@@ -525,6 +525,62 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 
 %end
 
+@interface SBApplication : NSObject
+@end
+
+@interface SBProcess : NSObject
+@end
+
+%hook SBApplication
+
+// 让系统认为豆包应用不在前台运行
+- (BOOL)isForeground {
+    if (IsDoubaoBundleID(self.displayIdentifier)) {
+        WriteLog(@"[LIE] SBApplication isForeground returning NO for Doubao");
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)isRunning {
+    if (IsDoubaoBundleID(self.displayIdentifier)) {
+        WriteLog(@"[LIE] SBApplication isRunning returning NO for Doubao");
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)isFrontmost {
+    if (IsDoubaoBundleID(self.displayIdentifier)) {
+        WriteLog(@"[LIE] SBApplication isFrontmost returning NO for Doubao");
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
+%hook SBProcess
+
+// 让系统认为豆包进程不在前台
+- (BOOL)isForeground {
+    if (IsDoubaoBundleID(self.bundleIdentifier)) {
+        WriteLog(@"[LIE] SBProcess isForeground returning NO for Doubao");
+        return NO;
+    }
+    return %orig;
+}
+
+- (BOOL)isRunning {
+    if (IsDoubaoBundleID(self.bundleIdentifier)) {
+        WriteLog(@"[LIE] SBProcess isRunning returning NO for Doubao");
+        return NO;
+    }
+    return %orig;
+}
+
+%end
+
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v0.0.7 state lying + window offscreen");
+    WriteLog(@"[INIT] HideDoubaoPiP v0.0.9 - SBApplication/SBProcess state lying");
 }
