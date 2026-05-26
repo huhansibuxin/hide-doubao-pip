@@ -161,7 +161,10 @@ static void HideDoubaoWindow(UIWindow *window) {
                     for (NSString *selName in candidates) {
                         SEL sel = NSSelectorFromString(selName);
                         if ([pegasus respondsToSelector:sel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
                             [pegasus performSelector:sel];
+#pragma clang diagnostic pop
                             break;
                         }
                     }
