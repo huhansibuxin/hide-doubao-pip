@@ -603,6 +603,33 @@ static void ClosePopupForBundleID(NSString *bundleID) {
     TryDestroySceneForBundleID(bundleID);
 }
 
+// ============================================================
+// Detection hook: FBScene activation (catches TrollOpen split-screen launches)
+// ============================================================
+
+static void ScheduleCloseForBundleID(NSString *bundleID) {
+    NSString *capturedBundleID = [bundleID copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoCloseDelay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ClosePopupForBundleID(capturedBundleID);
+    });
+}
+
+%hook FBScene
+
+- (void)activateWithTransitionContext:(id)context {
+    %orig;
+
+    NSString *bid = BundleIDFromFBScene(self);
+    if (IsAutoCloseBundleID(bid)) {
+        WriteLog(@"[AUTOCLOSE] FBScene activate detected: %@", bid);
+        ScheduleCloseForBundleID(bid);
+    }
+}
+
+%end
+
+// Fallback: SBMainWorkspace hook (standard app launch path)
 %hook SBMainWorkspace
 
 - (void)_handleOpenApplicationRequest:(id)request options:(id)options activationSettings:(id)settings origin:(id)origin withResult:(id)result {
@@ -618,16 +645,13 @@ static void ClosePopupForBundleID(NSString *bundleID) {
     %orig;
 
     if (IsAutoCloseBundleID(bundleID)) {
-        NSString *capturedBundleID = [bundleID copy];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoCloseDelay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            ClosePopupForBundleID(capturedBundleID);
-        });
+        WriteLog(@"[AUTOCLOSE] SBMainWorkspace open-app detected: %@", bundleID);
+        ScheduleCloseForBundleID(bundleID);
     }
 }
 
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v0.0.10 - PiP hide + multi-strategy autoclose");
+    WriteLog(@"[INIT] HideDoubaoPiP v0.0.11 - PiP hide + FBScene activation detection + multi-strategy autoclose");
 }
