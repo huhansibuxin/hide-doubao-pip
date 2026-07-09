@@ -450,18 +450,13 @@ static BOOL IsDoubaoPiPController(id pipCtrl) {
 // ============================================================
 // Part 2: Auto-close doubao/wetype split-screen popup
 //
-// Target bundles:
-//   com.bytedance.ios.doubaoime / com.bytedance.ios.doubaoime.keyboard
-//   com.tencent.wetype / com.tencent.wetype.keyboard
-//
 // Paid TrollOpen behavior (verified):
 //   Wetype renders briefly, then the popup auto-dismisses.
-//   Process is NOT killed — only the popup window disappears.
+//   The process is NOT killed — only the scene is destroyed.
 //
-// Multi-strategy close:
-//   1. FBSceneManager: find doubao scene → close via scene lifecycle
-//   2. UIWindow iteration: find doubao windows → hide (alpha=0, hidden=YES)
-//   3. SBMainWorkspace: externalApplicationSceneHandles → destroyScene (fallback)
+// Multi-strategy close (tried in order):
+//   1. UIWindow iteration: find doubao windows → hide (alpha=0, hidden=YES)
+//   2. SBMainWorkspace: externalApplicationSceneHandles → destroyScene
 // ============================================================
 
 static const NSTimeInterval kAutoCloseDelay = 2.0;
@@ -474,69 +469,8 @@ static BOOL IsAutoCloseBundleID(NSString *bundleID) {
            [bundleID isEqualToString:@"com.tencent.wetype.keyboard"];
 }
 
-// Get bundle ID from any FBScene-related object
-static NSString *BundleIDFromScene(id scene) {
-    if (!scene) return nil;
-    @try {
-        // Try identity → bundleIdentifier
-        id identity = [scene valueForKey:@"identity"];
-        if (identity) {
-            NSString *bid = [identity valueForKey:@"bundleIdentifier"];
-            if (bid) return bid;
-            bid = [identity valueForKey:@"_bundleIdentifier"];
-            if (bid) return bid;
-        }
-        // Try clientProcess
-        id cp = [scene valueForKey:@"clientProcess"];
-        if (cp) {
-            NSString *bid = [cp valueForKey:@"bundleIdentifier"];
-            if (bid) return bid;
-            bid = [cp valueForKey:@"_bundleIdentifier"];
-            if (bid) return bid;
-        }
-        // Try clientIdentity
-        id ci = [scene valueForKey:@"clientIdentity"];
-        if (ci) {
-            NSString *bid = [ci valueForKey:@"bundleIdentifier"];
-            if (bid) return bid;
-        }
-    } @catch (NSException *e) {}
-    return nil;
-}
-
-// Strategy 1: Close via FBSceneManager — invalidate doubao scene
-static BOOL TryCloseViaFBSceneManager(NSString *bundleID) {
-    @try {
-        Class mgrClass = objc_getClass("FBSceneManager");
-        if (!mgrClass) return NO;
-        id mgr = [mgrClass performSelector:@selector(sharedInstance)];
-        if (!mgr) return NO;
-
-        id scenes = [mgr valueForKey:@"_scenes"];
-        if (!scenes) scenes = [mgr valueForKey:@"scenes"];
-        if (![scenes respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) return NO;
-
-        for (id scene in scenes) {
-            @try {
-                NSString *bid = BundleIDFromScene(scene);
-                if (![bid isEqualToString:bundleID]) continue;
-
-                WriteLog(@"[AUTOCLOSE] Found doubao FBScene, closing...");
-
-                // Method A: scene invalidate
-                SEL invalidateSel = NSSelectorFromString(@"invalidate");
-                if ([scene respondsToSelector:invalidateSel]) {
-                    ((void (*)(id, SEL))objc_msgSend)(scene, invalidateSel);
-                    return YES;
-                }
-            } @catch (NSException *e) {}
-        }
-    } @catch (NSException *e) {}
-    return NO;
-}
-
-// Strategy 2: Iterate all UIWindows, find doubao windows, hide them
-static BOOL TryCloseViaUIWindows(NSString *bundleID) {
+// Strategy 1: Hide any UIWindow belonging to the target bundle
+static BOOL TryHideWindowsForBundleID(NSString *bundleID) {
     @try {
         Class appClass = objc_getClass("UIApplication");
         id app = [appClass performSelector:@selector(sharedApplication)];
@@ -547,7 +481,7 @@ static BOOL TryCloseViaUIWindows(NSString *bundleID) {
             if (window.hidden || window.alpha < 0.01) continue;
 
             @try {
-                // Try to get window's scene
+                // Check windowScene → FBScene for bundleID match
                 id windowScene = [window valueForKey:@"windowScene"];
                 if (!windowScene) windowScene = [window valueForKey:@"_windowScene"];
 
@@ -555,18 +489,18 @@ static BOOL TryCloseViaUIWindows(NSString *bundleID) {
                     id fbScene = [windowScene valueForKey:@"_scene"];
                     if (!fbScene) fbScene = [windowScene valueForKey:@"scene"];
 
-                    NSString *winBundleID = BundleIDFromScene(fbScene);
-                    if (![winBundleID isEqualToString:bundleID]) continue;
+                    if (fbScene) {
+                        id identity = [fbScene valueForKey:@"identity"];
+                        NSString *winBundleID = [identity valueForKey:@"bundleIdentifier"];
+                        if (![winBundleID isEqualToString:bundleID]) continue;
+
+                        WriteLog(@"[AUTOCLOSE] Hiding doubao window ptr=%p class=%@", window, SafeClassName(window));
+                        window.hidden = YES;
+                        window.alpha = 0.0;
+                        window.userInteractionEnabled = NO;
+                        found = YES;
+                    }
                 }
-
-                // Also try checking the window's root view controller
-                // for SBApplicationSceneHandle or similar associations
-
-                WriteLog(@"[AUTOCLOSE] Hiding doubao window ptr=%p class=%@", window, SafeClassName(window));
-                window.hidden = YES;
-                window.alpha = 0.0;
-                window.userInteractionEnabled = NO;
-                found = YES;
             } @catch (NSException *e) {}
         }
         return found;
@@ -574,15 +508,15 @@ static BOOL TryCloseViaUIWindows(NSString *bundleID) {
     return NO;
 }
 
-// Strategy 3: SBMainWorkspace externalApplicationSceneHandles → destroyScene (old approach)
-static BOOL TryCloseViaSceneHandles(NSString *bundleID) {
+// Strategy 2: externalApplicationSceneHandles → destroySceneWithTransitionContext
+static BOOL TryDestroySceneForBundleID(NSString *bundleID) {
     @try {
-        Class wsClass = objc_getClass("SBMainWorkspace");
-        if (!wsClass) return NO;
-        id ws = [wsClass performSelector:@selector(sharedInstance)];
-        if (!ws) return NO;
+        Class workspaceClass = objc_getClass("SBMainWorkspace");
+        if (!workspaceClass) return NO;
+        id workspace = [workspaceClass performSelector:@selector(sharedInstance)];
+        if (!workspace) return NO;
 
-        id sceneHandles = [ws valueForKey:@"externalApplicationSceneHandles"];
+        id sceneHandles = [workspace valueForKey:@"externalApplicationSceneHandles"];
         if (![sceneHandles respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) return NO;
 
         for (id handle in sceneHandles) {
@@ -607,75 +541,11 @@ static BOOL TryCloseViaSceneHandles(NSString *bundleID) {
     return NO;
 }
 
-// Strategy 4: SBSceneManager — find and close scene via layout
-static BOOL TryCloseViaSBSceneManager(NSString *bundleID) {
-    @try {
-        Class mgrClass = objc_getClass("SBSceneManager");
-        if (!mgrClass) return NO;
-        id mgr = [mgrClass performSelector:@selector(sharedInstance)];
-        if (!mgr) return NO;
-
-        // Try _layoutState → all scenes
-        id layoutState = [mgr valueForKey:@"_layoutState"];
-        if (!layoutState) layoutState = [mgr valueForKey:@"layoutState"];
-
-        if (layoutState) {
-            // Try to get app layouts
-            id appLayouts = [layoutState valueForKey:@"appLayouts"];
-            if (!appLayouts) appLayouts = [layoutState valueForKey:@"_appLayouts"];
-
-            if ([appLayouts respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
-                for (id appLayout in appLayouts) {
-                    @try {
-                        // Each app layout should have bundle identifiers or entity
-                        id entity = [appLayout valueForKey:@"entity"];
-                        if (!entity) entity = [appLayout valueForKey:@"_entity"];
-
-                        NSString *layoutBundleID = [entity valueForKey:@"bundleIdentifier"];
-                        if (!layoutBundleID) layoutBundleID = [entity valueForKey:@"_bundleIdentifier"];
-
-                        if (![layoutBundleID isEqualToString:bundleID]) continue;
-
-                        WriteLog(@"[AUTOCLOSE] Found doubao in SBSceneManager layout, attempting close");
-
-                        // Try to remove from layout
-                        SEL removeSel = NSSelectorFromString(@"removeEntity:");
-                        if ([layoutState respondsToSelector:removeSel]) {
-                            ((void (*)(id, SEL, id))objc_msgSend)(layoutState, removeSel, entity);
-                            return YES;
-                        }
-                    } @catch (NSException *e) {}
-                }
-            }
-        }
-
-        // Try getting scenes directly
-        id scenes = [mgr valueForKey:@"_scenes"];
-        if (!scenes) scenes = [mgr valueForKey:@"scenes"];
-
-        if ([scenes respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
-            for (id scene in scenes) {
-                @try {
-                    NSString *bid = BundleIDFromScene(scene);
-                    if (![bid isEqualToString:bundleID]) continue;
-
-                    // Try to deactivate scene
-                    SEL deactSel = NSSelectorFromString(@"sceneManager:didDeactivateScene:");
-                    // This approach might not work directly
-                } @catch (NSException *e) {}
-            }
-        }
-    } @catch (NSException *e) {}
-    return NO;
-}
-
 static void ClosePopupForBundleID(NSString *bundleID) {
     WriteLog(@"[AUTOCLOSE] Attempting to close popup for bundleID=%@", bundleID);
 
-    if (TryCloseViaFBSceneManager(bundleID)) return;
-    if (TryCloseViaUIWindows(bundleID)) return;
-    if (TryCloseViaSBSceneManager(bundleID)) return;
-    TryCloseViaSceneHandles(bundleID);
+    if (TryHideWindowsForBundleID(bundleID)) return;
+    TryDestroySceneForBundleID(bundleID);
 }
 
 %hook SBMainWorkspace
