@@ -5,104 +5,7 @@
 #import <time.h>
 
 // ============================================================
-// Part 1: Auto-close doubao/wetype split-screen popup
-//
-// Paid TrollOpen behavior (verified):
-//   Wetype renders briefly, then the popup auto-dismisses.
-//   The process is NOT killed — only the scene is destroyed.
-//
-// Our approach:
-//   1. Detect input method launch via SBMainWorkspace hook
-//   2. After 2.0s delay (scene fully created), find & destroy
-//      the scene handle via destroySceneWithTransitionContext:
-//   3. Process stays alive, only the popup window disappears
-// ============================================================
-
-static const NSTimeInterval kAutoCloseDelay = 2.0;
-
-static BOOL IsAutoCloseBundleID(NSString *bundleID) {
-    if (![bundleID isKindOfClass:[NSString class]]) return NO;
-    return [bundleID isEqualToString:@"com.bytedance.ios.doubaoime"] ||
-           [bundleID isEqualToString:@"com.bytedance.ios.doubaoime.keyboard"] ||
-           [bundleID isEqualToString:@"com.tencent.wetype"] ||
-           [bundleID isEqualToString:@"com.tencent.wetype.keyboard"];
-}
-
-// Destroy the scene handle for a given bundle ID
-// This dismisses the popup window WITHOUT killing the process
-static void DestroySceneForBundleID(NSString *bundleID) {
-    @try {
-        Class workspaceClass = objc_getClass("SBMainWorkspace");
-        if (!workspaceClass) return;
-        id workspace = [workspaceClass performSelector:@selector(sharedInstance)];
-        if (!workspace) return;
-
-        id sceneHandles = nil;
-        @try { sceneHandles = [workspace valueForKey:@"externalApplicationSceneHandles"]; }
-        @catch (NSException *e) { return; }
-
-        if (!sceneHandles || ![sceneHandles respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
-            return;
-        }
-
-        for (id handle in sceneHandles) {
-            @try {
-                // Try multiple ways to get bundleIdentifier from the handle
-                id app = nil;
-                @try { app = [handle valueForKey:@"application"]; } @catch (NSException *e) {}
-                if (!app) { @try { app = [handle valueForKey:@"_application"]; } @catch (NSException *e) {} }
-
-                NSString *handleBundleID = nil;
-                if (app) {
-                    @try { handleBundleID = [app valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
-                    if (!handleBundleID) {
-                        @try { handleBundleID = [app valueForKey:@"_bundleIdentifier"]; } @catch (NSException *e) {}
-                    }
-                    if (!handleBundleID && [app respondsToSelector:@selector(bundleIdentifier)]) {
-                        handleBundleID = [app performSelector:@selector(bundleIdentifier)];
-                    }
-                }
-
-                if (![handleBundleID isEqualToString:bundleID]) continue;
-
-                // Try destroySceneWithTransitionContext: (TrollOpen's method)
-                SEL destroySel = NSSelectorFromString(@"destroySceneWithTransitionContext:");
-                if ([handle respondsToSelector:destroySel]) {
-                    ((void (*)(id, SEL, id))objc_msgSend)(handle, destroySel, nil);
-                    return;
-                }
-            } @catch (NSException *e) {}
-        }
-    } @catch (NSException *e) {}
-}
-
-%hook SBMainWorkspace
-
-- (void)_handleOpenApplicationRequest:(id)request options:(id)options activationSettings:(id)settings origin:(id)origin withResult:(id)result {
-    NSString *bundleID = nil;
-    @try {
-        if ([request respondsToSelector:@selector(bundleIdentifier)]) {
-            bundleID = [request performSelector:@selector(bundleIdentifier)];
-        }
-    } @catch (NSException *e) {
-        @try { bundleID = [request valueForKey:@"bundleIdentifier"]; } @catch (NSException *e2) {}
-    }
-
-    %orig;
-
-    if (IsAutoCloseBundleID(bundleID)) {
-        NSString *capturedBundleID = bundleID;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoCloseDelay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            DestroySceneForBundleID(capturedBundleID);
-        });
-    }
-}
-
-%end
-
-// ============================================================
-// Part 2: Hide doubao PiP floating window
+// Part 1: Hide doubao PiP floating window
 // ============================================================
 
 static FILE *logFile = NULL;
@@ -520,7 +423,7 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 
 %end
 
-// idle timer hook: 阻止豆包 PiP 获取休眠锁
+// idle timer hook
 static BOOL IsDoubaoPiPController(id pipCtrl) {
     return IdentityFromPiPController(pipCtrl) == DoubaoPiPIdentityDoubao;
 }
@@ -544,6 +447,262 @@ static BOOL IsDoubaoPiPController(id pipCtrl) {
 
 %end
 
+// ============================================================
+// Part 2: Auto-close doubao/wetype split-screen popup
+//
+// Target bundles:
+//   com.bytedance.ios.doubaoime / com.bytedance.ios.doubaoime.keyboard
+//   com.tencent.wetype / com.tencent.wetype.keyboard
+//
+// Paid TrollOpen behavior (verified):
+//   Wetype renders briefly, then the popup auto-dismisses.
+//   Process is NOT killed — only the popup window disappears.
+//
+// Multi-strategy close:
+//   1. FBSceneManager: find doubao scene → close via scene lifecycle
+//   2. UIWindow iteration: find doubao windows → hide (alpha=0, hidden=YES)
+//   3. SBMainWorkspace: externalApplicationSceneHandles → destroyScene (fallback)
+// ============================================================
+
+static const NSTimeInterval kAutoCloseDelay = 2.0;
+
+static BOOL IsAutoCloseBundleID(NSString *bundleID) {
+    if (![bundleID isKindOfClass:[NSString class]]) return NO;
+    return [bundleID isEqualToString:@"com.bytedance.ios.doubaoime"] ||
+           [bundleID isEqualToString:@"com.bytedance.ios.doubaoime.keyboard"] ||
+           [bundleID isEqualToString:@"com.tencent.wetype"] ||
+           [bundleID isEqualToString:@"com.tencent.wetype.keyboard"];
+}
+
+// Get bundle ID from any FBScene-related object
+static NSString *BundleIDFromScene(id scene) {
+    if (!scene) return nil;
+    @try {
+        // Try identity → bundleIdentifier
+        id identity = [scene valueForKey:@"identity"];
+        if (identity) {
+            NSString *bid = [identity valueForKey:@"bundleIdentifier"];
+            if (bid) return bid;
+            bid = [identity valueForKey:@"_bundleIdentifier"];
+            if (bid) return bid;
+        }
+        // Try clientProcess
+        id cp = [scene valueForKey:@"clientProcess"];
+        if (cp) {
+            NSString *bid = [cp valueForKey:@"bundleIdentifier"];
+            if (bid) return bid;
+            bid = [cp valueForKey:@"_bundleIdentifier"];
+            if (bid) return bid;
+        }
+        // Try clientIdentity
+        id ci = [scene valueForKey:@"clientIdentity"];
+        if (ci) {
+            NSString *bid = [ci valueForKey:@"bundleIdentifier"];
+            if (bid) return bid;
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+// Strategy 1: Close via FBSceneManager — invalidate doubao scene
+static BOOL TryCloseViaFBSceneManager(NSString *bundleID) {
+    @try {
+        Class mgrClass = objc_getClass("FBSceneManager");
+        if (!mgrClass) return NO;
+        id mgr = [mgrClass performSelector:@selector(sharedInstance)];
+        if (!mgr) return NO;
+
+        id scenes = [mgr valueForKey:@"_scenes"];
+        if (!scenes) scenes = [mgr valueForKey:@"scenes"];
+        if (![scenes respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) return NO;
+
+        for (id scene in scenes) {
+            @try {
+                NSString *bid = BundleIDFromScene(scene);
+                if (![bid isEqualToString:bundleID]) continue;
+
+                WriteLog(@"[AUTOCLOSE] Found doubao FBScene, closing...");
+
+                // Method A: scene invalidate
+                SEL invalidateSel = NSSelectorFromString(@"invalidate");
+                if ([scene respondsToSelector:invalidateSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(scene, invalidateSel);
+                    return YES;
+                }
+            } @catch (NSException *e) {}
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+// Strategy 2: Iterate all UIWindows, find doubao windows, hide them
+static BOOL TryCloseViaUIWindows(NSString *bundleID) {
+    @try {
+        Class appClass = objc_getClass("UIApplication");
+        id app = [appClass performSelector:@selector(sharedApplication)];
+        NSArray *allWindows = [app valueForKey:@"windows"];
+
+        BOOL found = NO;
+        for (UIWindow *window in allWindows) {
+            if (window.hidden || window.alpha < 0.01) continue;
+
+            @try {
+                // Try to get window's scene
+                id windowScene = [window valueForKey:@"windowScene"];
+                if (!windowScene) windowScene = [window valueForKey:@"_windowScene"];
+
+                if (windowScene) {
+                    id fbScene = [windowScene valueForKey:@"_scene"];
+                    if (!fbScene) fbScene = [windowScene valueForKey:@"scene"];
+
+                    NSString *winBundleID = BundleIDFromScene(fbScene);
+                    if (![winBundleID isEqualToString:bundleID]) continue;
+                }
+
+                // Also try checking the window's root view controller
+                // for SBApplicationSceneHandle or similar associations
+
+                WriteLog(@"[AUTOCLOSE] Hiding doubao window ptr=%p class=%@", window, SafeClassName(window));
+                window.hidden = YES;
+                window.alpha = 0.0;
+                window.userInteractionEnabled = NO;
+                found = YES;
+            } @catch (NSException *e) {}
+        }
+        return found;
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+// Strategy 3: SBMainWorkspace externalApplicationSceneHandles → destroyScene (old approach)
+static BOOL TryCloseViaSceneHandles(NSString *bundleID) {
+    @try {
+        Class wsClass = objc_getClass("SBMainWorkspace");
+        if (!wsClass) return NO;
+        id ws = [wsClass performSelector:@selector(sharedInstance)];
+        if (!ws) return NO;
+
+        id sceneHandles = [ws valueForKey:@"externalApplicationSceneHandles"];
+        if (![sceneHandles respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) return NO;
+
+        for (id handle in sceneHandles) {
+            @try {
+                id app = [handle valueForKey:@"application"];
+                if (!app) app = [handle valueForKey:@"_application"];
+
+                NSString *handleBundleID = [app valueForKey:@"bundleIdentifier"];
+                if (!handleBundleID) handleBundleID = [app valueForKey:@"_bundleIdentifier"];
+
+                if (![handleBundleID isEqualToString:bundleID]) continue;
+
+                SEL destroySel = NSSelectorFromString(@"destroySceneWithTransitionContext:");
+                if ([handle respondsToSelector:destroySel]) {
+                    WriteLog(@"[AUTOCLOSE] destroySceneWithTransitionContext for %@", bundleID);
+                    ((void (*)(id, SEL, id))objc_msgSend)(handle, destroySel, nil);
+                    return YES;
+                }
+            } @catch (NSException *e) {}
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+// Strategy 4: SBSceneManager — find and close scene via layout
+static BOOL TryCloseViaSBSceneManager(NSString *bundleID) {
+    @try {
+        Class mgrClass = objc_getClass("SBSceneManager");
+        if (!mgrClass) return NO;
+        id mgr = [mgrClass performSelector:@selector(sharedInstance)];
+        if (!mgr) return NO;
+
+        // Try _layoutState → all scenes
+        id layoutState = [mgr valueForKey:@"_layoutState"];
+        if (!layoutState) layoutState = [mgr valueForKey:@"layoutState"];
+
+        if (layoutState) {
+            // Try to get app layouts
+            id appLayouts = [layoutState valueForKey:@"appLayouts"];
+            if (!appLayouts) appLayouts = [layoutState valueForKey:@"_appLayouts"];
+
+            if ([appLayouts respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
+                for (id appLayout in appLayouts) {
+                    @try {
+                        // Each app layout should have bundle identifiers or entity
+                        id entity = [appLayout valueForKey:@"entity"];
+                        if (!entity) entity = [appLayout valueForKey:@"_entity"];
+
+                        NSString *layoutBundleID = [entity valueForKey:@"bundleIdentifier"];
+                        if (!layoutBundleID) layoutBundleID = [entity valueForKey:@"_bundleIdentifier"];
+
+                        if (![layoutBundleID isEqualToString:bundleID]) continue;
+
+                        WriteLog(@"[AUTOCLOSE] Found doubao in SBSceneManager layout, attempting close");
+
+                        // Try to remove from layout
+                        SEL removeSel = NSSelectorFromString(@"removeEntity:");
+                        if ([layoutState respondsToSelector:removeSel]) {
+                            ((void (*)(id, SEL, id))objc_msgSend)(layoutState, removeSel, entity);
+                            return YES;
+                        }
+                    } @catch (NSException *e) {}
+                }
+            }
+        }
+
+        // Try getting scenes directly
+        id scenes = [mgr valueForKey:@"_scenes"];
+        if (!scenes) scenes = [mgr valueForKey:@"scenes"];
+
+        if ([scenes respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
+            for (id scene in scenes) {
+                @try {
+                    NSString *bid = BundleIDFromScene(scene);
+                    if (![bid isEqualToString:bundleID]) continue;
+
+                    // Try to deactivate scene
+                    SEL deactSel = NSSelectorFromString(@"sceneManager:didDeactivateScene:");
+                    // This approach might not work directly
+                } @catch (NSException *e) {}
+            }
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+static void ClosePopupForBundleID(NSString *bundleID) {
+    WriteLog(@"[AUTOCLOSE] Attempting to close popup for bundleID=%@", bundleID);
+
+    if (TryCloseViaFBSceneManager(bundleID)) return;
+    if (TryCloseViaUIWindows(bundleID)) return;
+    if (TryCloseViaSBSceneManager(bundleID)) return;
+    TryCloseViaSceneHandles(bundleID);
+}
+
+%hook SBMainWorkspace
+
+- (void)_handleOpenApplicationRequest:(id)request options:(id)options activationSettings:(id)settings origin:(id)origin withResult:(id)result {
+    NSString *bundleID = nil;
+    @try {
+        if ([request respondsToSelector:@selector(bundleIdentifier)]) {
+            bundleID = [request performSelector:@selector(bundleIdentifier)];
+        }
+    } @catch (NSException *e) {
+        @try { bundleID = [request valueForKey:@"bundleIdentifier"]; } @catch (NSException *e2) {}
+    }
+
+    %orig;
+
+    if (IsAutoCloseBundleID(bundleID)) {
+        NSString *capturedBundleID = [bundleID copy];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoCloseDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            ClosePopupForBundleID(capturedBundleID);
+        });
+    }
+}
+
+%end
+
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v0.0.9 - render-then-terminate autoclose");
+    WriteLog(@"[INIT] HideDoubaoPiP v0.0.10 - PiP hide + multi-strategy autoclose");
 }
