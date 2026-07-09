@@ -5,133 +5,82 @@
 #import <time.h>
 
 // ============================================================
-// Part 1: Auto-close doubao split-screen popup
+// Part 1: Auto-prevent doubao/wetype split-screen popup
+// Strategy: FBSOpenApplicationOptionKeyActivateSuspended
+// Reverse-engineered from TrollOpen paid v1.3.14
+//
+// Paid version intercepts wetype open requests, injects
+// ActivateSuspended=YES into options so the input method
+// launches in suspended state (never renders on screen),
+// then cleans up the suspended process after a delay.
 // ============================================================
 
-static const NSTimeInterval kDoubaoCloseDelay = 1.5;
+static const NSTimeInterval kAutoCloseDelay = 3.0;
 
-static BOOL IsDoubaoAppBundleID(NSString *bundleID) {
+static BOOL IsAutoCloseBundleID(NSString *bundleID) {
     if (![bundleID isKindOfClass:[NSString class]]) return NO;
     return [bundleID isEqualToString:@"com.bytedance.ios.doubaoime"] ||
-           [bundleID isEqualToString:@"com.bytedance.ios.doubaoime.keyboard"];
+           [bundleID isEqualToString:@"com.bytedance.ios.doubaoime.keyboard"] ||
+           [bundleID isEqualToString:@"com.tencent.wetype"] ||
+           [bundleID isEqualToString:@"com.tencent.wetype.keyboard"];
 }
 
-// Get process PID for a bundle ID via SBApplicationController
-static int GetPIDForBundleID(NSString *bundleID) {
-    @try {
-        Class appCtrlClass = objc_getClass("SBApplicationController");
-        if (!appCtrlClass) return -1;
-        id appCtrl = [appCtrlClass performSelector:@selector(sharedInstance)];
-        if (!appCtrl) return -1;
-
-        id app = nil;
-        if ([appCtrl respondsToSelector:@selector(applicationWithBundleIdentifier:)]) {
-            app = [appCtrl performSelector:@selector(applicationWithBundleIdentifier:) withObject:bundleID];
-        }
-        if (!app) return -1;
-
-        id process = nil;
-        @try { process = [app valueForKey:@"_process"]; } @catch (NSException *e) {}
-        if (!process) {
-            @try { process = [app valueForKey:@"process"]; } @catch (NSException *e) {}
-        }
-        if (!process) return -1;
-
-        int pid = -1;
-        @try { pid = [[process valueForKey:@"pid"] intValue]; } @catch (NSException *e) {}
-        return pid;
-    } @catch (NSException *e) {
-        return -1;
-    }
-}
-
-// Terminate via FBProcessManager (same approach as TrollOpen)
-static BOOL TerminateByProcessManager(int pid) {
-    if (pid <= 0) return NO;
-
+// Terminate a suspended process by enumerating FBProcessManager.allProcesses
+static BOOL TerminateSuspendedApp(NSString *bundleID) {
     @try {
         Class FBProcessManager = objc_getClass("FBProcessManager");
         if (!FBProcessManager) return NO;
         id pm = [FBProcessManager performSelector:@selector(sharedInstance)];
         if (!pm) return NO;
 
-        if ([pm respondsToSelector:@selector(processForPID:)]) {
-            id process = [pm performSelector:@selector(processForPID:) withObject:@(pid)];
-            if (process) {
+        // Enumerate all processes to find the suspended one
+        NSArray *processes = nil;
+        @try { processes = [pm valueForKey:@"_allProcesses"]; } @catch (NSException *e) {}
+        if (!processes) {
+            @try { processes = [pm valueForKey:@"allProcesses"]; } @catch (NSException *e) {}
+        }
+
+        if (processes && [processes isKindOfClass:[NSArray class]]) {
+            for (id process in processes) {
+                NSString *pidBundleID = nil;
+                @try { pidBundleID = [process valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
+                if (![pidBundleID isEqualToString:bundleID]) continue;
+
                 if ([pm respondsToSelector:@selector(terminateApplication:forReason:andReport:withDescription:completion:)]) {
                     SEL termSel = @selector(terminateApplication:forReason:andReport:withDescription:completion:);
                     NSMethodSignature *sig = [pm methodSignatureForSelector:termSel];
-                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                    [inv setTarget:pm];
-                    [inv setSelector:termSel];
-                    [inv setArgument:&process atIndex:2];
-                    int reason = 1;
-                    [inv setArgument:&reason atIndex:3];
-                    BOOL report = NO;
-                    [inv setArgument:&report atIndex:4];
-                    NSString *desc = @"doubao autoclose";
-                    [inv setArgument:&desc atIndex:5];
-                    [inv invoke];
-                    return YES;
+                    if (sig) {
+                        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                        [inv setTarget:pm];
+                        [inv setSelector:termSel];
+                        [inv setArgument:&process atIndex:2];
+                        int reason = 1;
+                        [inv setArgument:&reason atIndex:3];
+                        BOOL report = NO;
+                        [inv setArgument:&report atIndex:4];
+                        NSString *desc = @"autoclose suspended";
+                        [inv setArgument:&desc atIndex:5];
+                        [inv invoke];
+                        return YES;
+                    }
                 }
             }
         }
-    } @catch (NSException *e) {}
-    return NO;
-}
 
-// Close via destroyScene (TrollOpen's main approach)
-static BOOL DestroySceneForBundleID(NSString *bundleID) {
-    @try {
-        Class SBMainWorkspace = objc_getClass("SBMainWorkspace");
-        if (!SBMainWorkspace) return NO;
-        id workspace = [SBMainWorkspace performSelector:@selector(sharedInstance)];
-        if (!workspace) return NO;
-
-        id sceneHandles = nil;
-        @try { sceneHandles = [workspace valueForKey:@"externalApplicationSceneHandles"]; }
-        @catch (NSException *e) {}
-
-        if (!sceneHandles) return NO;
-
-        for (id handle in sceneHandles) {
-            @try {
-                id app = nil;
-                @try { app = [handle valueForKey:@"application"]; } @catch (NSException *e) {}
-                if (!app) { @try { app = [handle valueForKey:@"_application"]; } @catch (NSException *e) {} }
-
-                NSString *handleBundleID = nil;
-                @try { handleBundleID = [app valueForKey:@"bundleIdentifier"]; }
-                @catch (NSException *e) {}
-                if (!handleBundleID) {
-                    @try { handleBundleID = [app valueForKey:@"_bundleIdentifier"]; }
-                    @catch (NSException *e) {}
-                }
-
-                if (![handleBundleID isEqualToString:bundleID]) continue;
-
-                SEL destroySel = NSSelectorFromString(@"destroySceneWithTransitionContext:");
-                if ([handle respondsToSelector:destroySel]) {
-                    ((void (*)(id, SEL, id))objc_msgSend)(handle, destroySel, nil);
-                    return YES;
-                }
-            } @catch (NSException *e) {}
+        // Fallback: terminateBundleViaSystemService (paid version path)
+        SEL termSel = @selector(terminateBundleViaSystemService:completion:);
+        if ([pm respondsToSelector:termSel]) {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(pm, termSel, bundleID, nil);
+            return YES;
         }
     } @catch (NSException *e) {}
     return NO;
-}
-
-static void PerformAutoClose(NSString *bundleID) {
-    int pid = GetPIDForBundleID(bundleID);
-    if (pid > 0 && TerminateByProcessManager(pid)) return;
-    DestroySceneForBundleID(bundleID);
 }
 
 %hook SBMainWorkspace
 
+// Full signature hook - intercept BEFORE app is launched, modify options
 - (void)_handleOpenApplicationRequest:(id)request options:(id)options activationSettings:(id)settings origin:(id)origin withResult:(id)result {
-    %orig;
-
     @try {
         NSString *bundleID = nil;
         if ([request respondsToSelector:@selector(bundleIdentifier)]) {
@@ -139,17 +88,32 @@ static void PerformAutoClose(NSString *bundleID) {
         } else {
             @try {
                 bundleID = [request valueForKey:@"bundleIdentifier"];
-            } @catch (NSException *e) { return; }
+            } @catch (NSException *e) {}
         }
 
-        if (!IsDoubaoAppBundleID(bundleID)) return;
+        if (IsAutoCloseBundleID(bundleID)) {
+            // Inject ActivateSuspended into options → app launches suspended (invisible)
+            NSMutableDictionary *newOptions = nil;
+            if ([options isKindOfClass:[NSDictionary class]]) {
+                newOptions = [(NSDictionary *)options mutableCopy];
+            }
+            if (!newOptions) {
+                newOptions = [NSMutableDictionary dictionary];
+            }
+            newOptions[@"FBSOpenApplicationOptionKeyActivateSuspended"] = @YES;
 
-        NSString *capturedBundleID = bundleID;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDoubaoCloseDelay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            PerformAutoClose(capturedBundleID);
-        });
+            %orig(request, newOptions, settings, origin, result);
+
+            NSString *capturedBundleID = bundleID;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoCloseDelay * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                TerminateSuspendedApp(capturedBundleID);
+            });
+            return;
+        }
     } @catch (NSException *e) {}
+
+    %orig;
 }
 
 %end
@@ -598,5 +562,5 @@ static BOOL IsDoubaoPiPController(id pipCtrl) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.4");
+    WriteLog(@"[INIT] HideDoubaoPiP v0.0.8 - ActivateSuspended autoclose");
 }

@@ -1,3 +1,11 @@
+v0.0.8: FBSOpenApplicationOptionKeyActivateSuspended autoclose
+- 逆向分析 TrollOpen 付费版 v1.3.14，发现其对微信输入法使用 ActivateSuspended 机制
+- Part 1 全部重写：hook _handleOpenApplicationRequest:options:... 在 %orig 之前注入 ActivateSuspended=YES
+- 豆包/微信输入法以挂起态启动（从不渲染弹窗），3 秒后清理挂起进程
+- 支持 com.bytedance.ios.doubaoime / doubaoime.keyboard / wetype / wetype.keyboard
+
+v0.0.7: FBProcessManager.terminateApplication + destroyScene autoclose（无效）
+
 HideDoubaoPiP v2
 
 主要作用：仅隐藏豆包输入法创建的 PiP 悬浮窗，保留 Bilibili、微信等正常视频 PiP。
