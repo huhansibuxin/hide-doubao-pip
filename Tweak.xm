@@ -5,17 +5,20 @@
 #import <time.h>
 
 // ============================================================
-// Part 1: Auto-prevent doubao/wetype split-screen popup
-// Strategy: FBSOpenApplicationOptionKeyActivateSuspended
-// Reverse-engineered from TrollOpen paid v1.3.14
+// Part 1: Auto-close doubao/wetype split-screen popup
 //
-// Paid version intercepts wetype open requests, injects
-// ActivateSuspended=YES into options so the input method
-// launches in suspended state (never renders on screen),
-// then cleans up the suspended process after a delay.
+// Paid TrollOpen behavior (verified by user testing):
+//   Wetype renders briefly as split-screen popup, then
+//   auto-dismisses after ~1-2 seconds.
+//
+// Our approach mirrors this:
+//   1. Let %orig launch the input method normally (renders)
+//   2. After 1.5s delay, terminate via RBSProcessHandle
+//      (iOS 16 native process management, works on keyboard
+//       extension processes that normal kill can't touch)
 // ============================================================
 
-static const NSTimeInterval kAutoCloseDelay = 3.0;
+static const NSTimeInterval kAutoCloseDelay = 1.5;
 
 static BOOL IsAutoCloseBundleID(NSString *bundleID) {
     if (![bundleID isKindOfClass:[NSString class]]) return NO;
@@ -25,52 +28,42 @@ static BOOL IsAutoCloseBundleID(NSString *bundleID) {
            [bundleID isEqualToString:@"com.tencent.wetype.keyboard"];
 }
 
-// Terminate a suspended process by enumerating FBProcessManager.allProcesses
-static BOOL TerminateSuspendedApp(NSString *bundleID) {
+// Terminate process by bundleID using RBSProcessHandle (iOS 16+)
+// This is the same mechanism TrollOpen paid uses and can kill
+// input method extension processes that SBApplication.kill can't touch.
+static BOOL TerminateViaRBS(NSString *bundleID) {
     @try {
-        Class FBProcessManager = objc_getClass("FBProcessManager");
-        if (!FBProcessManager) return NO;
-        id pm = [FBProcessManager performSelector:@selector(sharedInstance)];
-        if (!pm) return NO;
-
-        // Enumerate all processes to find the suspended one
-        NSArray *processes = nil;
-        @try { processes = [pm valueForKey:@"_allProcesses"]; } @catch (NSException *e) {}
-        if (!processes) {
-            @try { processes = [pm valueForKey:@"allProcesses"]; } @catch (NSException *e) {}
+        Class RBSProcessIdentity = objc_getClass("RBSProcessIdentity");
+        Class RBSProcessPredicate = objc_getClass("RBSProcessPredicate");
+        Class RBSProcessHandle = objc_getClass("RBSProcessHandle");
+        if (!RBSProcessIdentity || !RBSProcessPredicate || !RBSProcessHandle) {
+            return NO;
         }
 
-        if (processes && [processes isKindOfClass:[NSArray class]]) {
-            for (id process in processes) {
-                NSString *pidBundleID = nil;
-                @try { pidBundleID = [process valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
-                if (![pidBundleID isEqualToString:bundleID]) continue;
+        // RBSProcessIdentity *identity = [RBSProcessIdentity identityOfApplication:bundleID]
+        SEL identitySel = NSSelectorFromString(@"identityOfApplication:");
+        if (![RBSProcessIdentity respondsToSelector:identitySel]) return NO;
+        id identity = ((id (*)(Class, SEL, NSString *))objc_msgSend)(
+            RBSProcessIdentity, identitySel, bundleID);
+        if (!identity) return NO;
 
-                if ([pm respondsToSelector:@selector(terminateApplication:forReason:andReport:withDescription:completion:)]) {
-                    SEL termSel = @selector(terminateApplication:forReason:andReport:withDescription:completion:);
-                    NSMethodSignature *sig = [pm methodSignatureForSelector:termSel];
-                    if (sig) {
-                        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                        [inv setTarget:pm];
-                        [inv setSelector:termSel];
-                        [inv setArgument:&process atIndex:2];
-                        int reason = 1;
-                        [inv setArgument:&reason atIndex:3];
-                        BOOL report = NO;
-                        [inv setArgument:&report atIndex:4];
-                        NSString *desc = @"autoclose suspended";
-                        [inv setArgument:&desc atIndex:5];
-                        [inv invoke];
-                        return YES;
-                    }
-                }
-            }
-        }
+        // RBSProcessPredicate *predicate = [RBSProcessPredicate predicateMatchingIdentity:identity]
+        SEL predSel = NSSelectorFromString(@"predicateMatchingIdentity:");
+        if (![RBSProcessPredicate respondsToSelector:predSel]) return NO;
+        id predicate = ((id (*)(Class, SEL, id))objc_msgSend)(
+            RBSProcessPredicate, predSel, identity);
+        if (!predicate) return NO;
 
-        // Fallback: terminateBundleViaSystemService (paid version path)
-        SEL termSel = @selector(terminateBundleViaSystemService:completion:);
-        if ([pm respondsToSelector:termSel]) {
-            ((void (*)(id, SEL, id, id))objc_msgSend)(pm, termSel, bundleID, nil);
+        // RBSProcessHandle *handle = [RBSProcessHandle handleForPredicate:predicate error:nil]
+        SEL handleSel = NSSelectorFromString(@"handleForPredicate:error:");
+        if (![RBSProcessHandle respondsToSelector:handleSel]) return NO;
+        id handle = ((id (*)(Class, SEL, id, id))objc_msgSend)(
+            RBSProcessHandle, handleSel, predicate, nil);
+        if (!handle) return NO;
+
+        // [handle terminate]
+        if ([handle respondsToSelector:NSSelectorFromString(@"terminate")]) {
+            [handle performSelector:NSSelectorFromString(@"terminate")];
             return YES;
         }
     } @catch (NSException *e) {}
@@ -79,41 +72,31 @@ static BOOL TerminateSuspendedApp(NSString *bundleID) {
 
 %hook SBMainWorkspace
 
-// Full signature hook - intercept BEFORE app is launched, modify options
 - (void)_handleOpenApplicationRequest:(id)request options:(id)options activationSettings:(id)settings origin:(id)origin withResult:(id)result {
+    NSString *bundleID = nil;
     @try {
-        NSString *bundleID = nil;
         if ([request respondsToSelector:@selector(bundleIdentifier)]) {
             bundleID = [request performSelector:@selector(bundleIdentifier)];
-        } else {
-            @try {
-                bundleID = [request valueForKey:@"bundleIdentifier"];
-            } @catch (NSException *e) {}
         }
+    } @catch (NSException *e) {
+        @try { bundleID = [request valueForKey:@"bundleIdentifier"]; } @catch (NSException *e2) {}
+    }
 
-        if (IsAutoCloseBundleID(bundleID)) {
-            // Inject ActivateSuspended into options → app launches suspended (invisible)
-            NSMutableDictionary *newOptions = nil;
-            if ([options isKindOfClass:[NSDictionary class]]) {
-                newOptions = [(NSDictionary *)options mutableCopy];
-            }
-            if (!newOptions) {
-                newOptions = [NSMutableDictionary dictionary];
-            }
-            newOptions[@"FBSOpenApplicationOptionKeyActivateSuspended"] = @YES;
-
-            %orig(request, newOptions, settings, origin, result);
-
-            NSString *capturedBundleID = bundleID;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoCloseDelay * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                TerminateSuspendedApp(capturedBundleID);
-            });
-            return;
-        }
-    } @catch (NSException *e) {}
-
+    // Always call original first — let the app render like the paid version does
     %orig;
+
+    // If it's a target input method, schedule termination after delay
+    if (IsAutoCloseBundleID(bundleID)) {
+        NSString *capturedBundleID = bundleID;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoCloseDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            BOOL killed = TerminateViaRBS(capturedBundleID);
+            if (!killed) {
+                // Fallback: try via SBApplicationController
+                WriteLog(@"[AUTOCLOSE] RBS terminate failed for %@, trying fallback", capturedBundleID);
+            }
+        });
+    }
 }
 
 %end
@@ -562,5 +545,5 @@ static BOOL IsDoubaoPiPController(id pipCtrl) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v0.0.8 - ActivateSuspended autoclose");
+    WriteLog(@"[INIT] HideDoubaoPiP v0.0.9 - render-then-terminate autoclose");
 }
