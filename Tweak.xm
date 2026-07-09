@@ -4,6 +4,89 @@
 #import <sys/stat.h>
 #import <time.h>
 
+// ============================================================
+// Part 1: Auto-close doubao split-screen popup
+// ============================================================
+
+static const NSTimeInterval kDoubaoCloseDelay = 1.5;
+static dispatch_queue_t sDoubaoCloseQueue = NULL;
+
+static BOOL IsDoubaoAppBundleID(NSString *bundleID) {
+    if (![bundleID isKindOfClass:[NSString class]]) return NO;
+    return [bundleID isEqualToString:@"com.bytedance.ios.doubaoime"] ||
+           [bundleID isEqualToString:@"com.bytedance.ios.doubaoime.keyboard"];
+}
+
+static void CloseApplicationBySBMethods(id app) {
+    if (!app) return;
+
+    SEL selectors[] = {
+        NSSelectorFromString(@"kill"),
+        NSSelectorFromString(@"killApplication"),
+        NSSelectorFromString(@"_kill"),
+    };
+
+    for (int i = 0; i < sizeof(selectors) / sizeof(SEL); i++) {
+        if ([app respondsToSelector:selectors[i]]) {
+            ((void (*)(id, SEL))objc_msgSend)(app, selectors[i]);
+            return;
+        }
+    }
+}
+
+static void TryCloseDoubaoApp(NSString *bundleID) {
+    @try {
+        Class appCtrlClass = objc_getClass("SBApplicationController");
+        if (!appCtrlClass) return;
+
+        id appCtrl = [appCtrlClass performSelector:@selector(sharedInstance)];
+        if (!appCtrl) return;
+
+        id app = nil;
+        if ([appCtrl respondsToSelector:@selector(applicationWithBundleIdentifier:)]) {
+            app = [appCtrl performSelector:@selector(applicationWithBundleIdentifier:) withObject:bundleID];
+        }
+
+        if (!app) return;
+
+        CloseApplicationBySBMethods(app);
+    } @catch (NSException *e) {}
+}
+
+%hook SBMainWorkspace
+
+- (void)_handleOpenApplicationRequest:(id)request options:(id)options activationSettings:(id)settings origin:(id)origin withResult:(id)result {
+    %orig;
+
+    @try {
+        NSString *bundleID = nil;
+        if ([request respondsToSelector:@selector(bundleIdentifier)]) {
+            bundleID = [request performSelector:@selector(bundleIdentifier)];
+        } else {
+            @try {
+                bundleID = [request valueForKey:@"bundleIdentifier"];
+            } @catch (NSException *e) { return; }
+        }
+
+        if (!IsDoubaoAppBundleID(bundleID)) return;
+
+        if (!sDoubaoCloseQueue) {
+            sDoubaoCloseQueue = dispatch_queue_create("com.ayao.doubaoautoclose", NULL);
+        }
+
+        NSString *capturedBundleID = bundleID;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDoubaoCloseDelay * NSEC_PER_SEC)), sDoubaoCloseQueue, ^{
+            TryCloseDoubaoApp(capturedBundleID);
+        });
+    } @catch (NSException *e) {}
+}
+
+%end
+
+// ============================================================
+// Part 2: Hide doubao PiP floating window
+// ============================================================
+
 static FILE *logFile = NULL;
 static const NSUInteger kMaxLogSize = 512 * 1024;
 static NSString *const kLogPath = @"/var/mobile/Documents/PiPArrowHide.log";
@@ -444,5 +527,5 @@ static BOOL IsDoubaoPiPController(id pipCtrl) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.3");
+    WriteLog(@"[INIT] HideDoubaoPiP v1.0.4");
 }
