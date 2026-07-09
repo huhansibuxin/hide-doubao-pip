@@ -9,7 +9,6 @@
 // ============================================================
 
 static const NSTimeInterval kDoubaoCloseDelay = 1.5;
-static dispatch_queue_t sDoubaoCloseQueue = NULL;
 
 static BOOL IsDoubaoAppBundleID(NSString *bundleID) {
     if (![bundleID isKindOfClass:[NSString class]]) return NO;
@@ -17,40 +16,115 @@ static BOOL IsDoubaoAppBundleID(NSString *bundleID) {
            [bundleID isEqualToString:@"com.bytedance.ios.doubaoime.keyboard"];
 }
 
-static void CloseApplicationBySBMethods(id app) {
-    if (!app) return;
-
-    SEL selectors[] = {
-        NSSelectorFromString(@"kill"),
-        NSSelectorFromString(@"killApplication"),
-        NSSelectorFromString(@"_kill"),
-    };
-
-    for (int i = 0; i < sizeof(selectors) / sizeof(SEL); i++) {
-        if ([app respondsToSelector:selectors[i]]) {
-            ((void (*)(id, SEL))objc_msgSend)(app, selectors[i]);
-            return;
-        }
-    }
-}
-
-static void TryCloseDoubaoApp(NSString *bundleID) {
+// Get process PID for a bundle ID via SBApplicationController
+static int GetPIDForBundleID(NSString *bundleID) {
     @try {
         Class appCtrlClass = objc_getClass("SBApplicationController");
-        if (!appCtrlClass) return;
-
+        if (!appCtrlClass) return -1;
         id appCtrl = [appCtrlClass performSelector:@selector(sharedInstance)];
-        if (!appCtrl) return;
+        if (!appCtrl) return -1;
 
         id app = nil;
         if ([appCtrl respondsToSelector:@selector(applicationWithBundleIdentifier:)]) {
             app = [appCtrl performSelector:@selector(applicationWithBundleIdentifier:) withObject:bundleID];
         }
+        if (!app) return -1;
 
-        if (!app) return;
+        id process = nil;
+        @try { process = [app valueForKey:@"_process"]; } @catch (NSException *e) {}
+        if (!process) {
+            @try { process = [app valueForKey:@"process"]; } @catch (NSException *e) {}
+        }
+        if (!process) return -1;
 
-        CloseApplicationBySBMethods(app);
+        int pid = -1;
+        @try { pid = [[process valueForKey:@"pid"] intValue]; } @catch (NSException *e) {}
+        return pid;
+    } @catch (NSException *e) {
+        return -1;
+    }
+}
+
+// Terminate via FBProcessManager (same approach as TrollOpen)
+static BOOL TerminateByProcessManager(int pid) {
+    if (pid <= 0) return NO;
+
+    @try {
+        Class FBProcessManager = objc_getClass("FBProcessManager");
+        if (!FBProcessManager) return NO;
+        id pm = [FBProcessManager performSelector:@selector(sharedInstance)];
+        if (!pm) return NO;
+
+        if ([pm respondsToSelector:@selector(processForPID:)]) {
+            id process = [pm performSelector:@selector(processForPID:) withObject:@(pid)];
+            if (process) {
+                if ([pm respondsToSelector:@selector(terminateApplication:forReason:andReport:withDescription:completion:)]) {
+                    SEL termSel = @selector(terminateApplication:forReason:andReport:withDescription:completion:);
+                    NSMethodSignature *sig = [pm methodSignatureForSelector:termSel];
+                    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                    [inv setTarget:pm];
+                    [inv setSelector:termSel];
+                    [inv setArgument:&process atIndex:2];
+                    int reason = 1;
+                    [inv setArgument:&reason atIndex:3];
+                    BOOL report = NO;
+                    [inv setArgument:&report atIndex:4];
+                    NSString *desc = @"doubao autoclose";
+                    [inv setArgument:&desc atIndex:5];
+                    [inv invoke];
+                    return YES;
+                }
+            }
+        }
     } @catch (NSException *e) {}
+    return NO;
+}
+
+// Close via destroyScene (TrollOpen's main approach)
+static BOOL DestroySceneForBundleID(NSString *bundleID) {
+    @try {
+        Class SBMainWorkspace = objc_getClass("SBMainWorkspace");
+        if (!SBMainWorkspace) return NO;
+        id workspace = [SBMainWorkspace performSelector:@selector(sharedInstance)];
+        if (!workspace) return NO;
+
+        id sceneHandles = nil;
+        @try { sceneHandles = [workspace valueForKey:@"externalApplicationSceneHandles"]; }
+        @catch (NSException *e) {}
+
+        if (!sceneHandles) return NO;
+
+        for (id handle in sceneHandles) {
+            @try {
+                id app = nil;
+                @try { app = [handle valueForKey:@"application"]; } @catch (NSException *e) {}
+                if (!app) { @try { app = [handle valueForKey:@"_application"]; } @catch (NSException *e) {} }
+
+                NSString *handleBundleID = nil;
+                @try { handleBundleID = [app valueForKey:@"bundleIdentifier"]; }
+                @catch (NSException *e) {}
+                if (!handleBundleID) {
+                    @try { handleBundleID = [app valueForKey:@"_bundleIdentifier"]; }
+                    @catch (NSException *e) {}
+                }
+
+                if (![handleBundleID isEqualToString:bundleID]) continue;
+
+                SEL destroySel = NSSelectorFromString(@"destroySceneWithTransitionContext:");
+                if ([handle respondsToSelector:destroySel]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(handle, destroySel, nil);
+                    return YES;
+                }
+            } @catch (NSException *e) {}
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+static void PerformAutoClose(NSString *bundleID) {
+    int pid = GetPIDForBundleID(bundleID);
+    if (pid > 0 && TerminateByProcessManager(pid)) return;
+    DestroySceneForBundleID(bundleID);
 }
 
 %hook SBMainWorkspace
@@ -70,13 +144,10 @@ static void TryCloseDoubaoApp(NSString *bundleID) {
 
         if (!IsDoubaoAppBundleID(bundleID)) return;
 
-        if (!sDoubaoCloseQueue) {
-            sDoubaoCloseQueue = dispatch_queue_create("com.ayao.doubaoautoclose", NULL);
-        }
-
         NSString *capturedBundleID = bundleID;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDoubaoCloseDelay * NSEC_PER_SEC)), sDoubaoCloseQueue, ^{
-            TryCloseDoubaoApp(capturedBundleID);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kDoubaoCloseDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            PerformAutoClose(capturedBundleID);
         });
     } @catch (NSException *e) {}
 }
