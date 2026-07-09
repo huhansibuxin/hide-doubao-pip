@@ -7,18 +7,18 @@
 // ============================================================
 // Part 1: Auto-close doubao/wetype split-screen popup
 //
-// Paid TrollOpen behavior (verified by user testing):
-//   Wetype renders briefly as split-screen popup, then
-//   auto-dismisses after ~1-2 seconds.
+// Paid TrollOpen behavior (verified):
+//   Wetype renders briefly, then the popup auto-dismisses.
+//   The process is NOT killed — only the scene is destroyed.
 //
-// Our approach mirrors this:
-//   1. Let %orig launch the input method normally (renders)
-//   2. After 1.5s delay, terminate via RBSProcessHandle
-//      (iOS 16 native process management, works on keyboard
-//       extension processes that normal kill can't touch)
+// Our approach:
+//   1. Detect input method launch via SBMainWorkspace hook
+//   2. After 2.0s delay (scene fully created), find & destroy
+//      the scene handle via destroySceneWithTransitionContext:
+//   3. Process stays alive, only the popup window disappears
 // ============================================================
 
-static const NSTimeInterval kAutoCloseDelay = 1.5;
+static const NSTimeInterval kAutoCloseDelay = 2.0;
 
 static BOOL IsAutoCloseBundleID(NSString *bundleID) {
     if (![bundleID isKindOfClass:[NSString class]]) return NO;
@@ -28,46 +28,52 @@ static BOOL IsAutoCloseBundleID(NSString *bundleID) {
            [bundleID isEqualToString:@"com.tencent.wetype.keyboard"];
 }
 
-// Terminate process by bundleID using RBSProcessHandle (iOS 16+)
-// This is the same mechanism TrollOpen paid uses and can kill
-// input method extension processes that SBApplication.kill can't touch.
-static BOOL TerminateViaRBS(NSString *bundleID) {
+// Destroy the scene handle for a given bundle ID
+// This dismisses the popup window WITHOUT killing the process
+static void DestroySceneForBundleID(NSString *bundleID) {
     @try {
-        Class RBSProcessIdentity = objc_getClass("RBSProcessIdentity");
-        Class RBSProcessPredicate = objc_getClass("RBSProcessPredicate");
-        Class RBSProcessHandle = objc_getClass("RBSProcessHandle");
-        if (!RBSProcessIdentity || !RBSProcessPredicate || !RBSProcessHandle) {
-            return NO;
+        Class workspaceClass = objc_getClass("SBMainWorkspace");
+        if (!workspaceClass) return;
+        id workspace = [workspaceClass performSelector:@selector(sharedInstance)];
+        if (!workspace) return;
+
+        id sceneHandles = nil;
+        @try { sceneHandles = [workspace valueForKey:@"externalApplicationSceneHandles"]; }
+        @catch (NSException *e) { return; }
+
+        if (!sceneHandles || ![sceneHandles respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
+            return;
         }
 
-        // RBSProcessIdentity *identity = [RBSProcessIdentity identityOfApplication:bundleID]
-        SEL identitySel = NSSelectorFromString(@"identityOfApplication:");
-        if (![RBSProcessIdentity respondsToSelector:identitySel]) return NO;
-        id identity = ((id (*)(Class, SEL, NSString *))objc_msgSend)(
-            RBSProcessIdentity, identitySel, bundleID);
-        if (!identity) return NO;
+        for (id handle in sceneHandles) {
+            @try {
+                // Try multiple ways to get bundleIdentifier from the handle
+                id app = nil;
+                @try { app = [handle valueForKey:@"application"]; } @catch (NSException *e) {}
+                if (!app) { @try { app = [handle valueForKey:@"_application"]; } @catch (NSException *e) {} }
 
-        // RBSProcessPredicate *predicate = [RBSProcessPredicate predicateMatchingIdentity:identity]
-        SEL predSel = NSSelectorFromString(@"predicateMatchingIdentity:");
-        if (![RBSProcessPredicate respondsToSelector:predSel]) return NO;
-        id predicate = ((id (*)(Class, SEL, id))objc_msgSend)(
-            RBSProcessPredicate, predSel, identity);
-        if (!predicate) return NO;
+                NSString *handleBundleID = nil;
+                if (app) {
+                    @try { handleBundleID = [app valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
+                    if (!handleBundleID) {
+                        @try { handleBundleID = [app valueForKey:@"_bundleIdentifier"]; } @catch (NSException *e) {}
+                    }
+                    if (!handleBundleID && [app respondsToSelector:@selector(bundleIdentifier)]) {
+                        handleBundleID = [app performSelector:@selector(bundleIdentifier)];
+                    }
+                }
 
-        // RBSProcessHandle *handle = [RBSProcessHandle handleForPredicate:predicate error:nil]
-        SEL handleSel = NSSelectorFromString(@"handleForPredicate:error:");
-        if (![RBSProcessHandle respondsToSelector:handleSel]) return NO;
-        id handle = ((id (*)(Class, SEL, id, id))objc_msgSend)(
-            RBSProcessHandle, handleSel, predicate, nil);
-        if (!handle) return NO;
+                if (![handleBundleID isEqualToString:bundleID]) continue;
 
-        // [handle terminate]
-        if ([handle respondsToSelector:NSSelectorFromString(@"terminate")]) {
-            [handle performSelector:NSSelectorFromString(@"terminate")];
-            return YES;
+                // Try destroySceneWithTransitionContext: (TrollOpen's method)
+                SEL destroySel = NSSelectorFromString(@"destroySceneWithTransitionContext:");
+                if ([handle respondsToSelector:destroySel]) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(handle, destroySel, nil);
+                    return;
+                }
+            } @catch (NSException *e) {}
         }
     } @catch (NSException *e) {}
-    return NO;
 }
 
 %hook SBMainWorkspace
@@ -82,19 +88,13 @@ static BOOL TerminateViaRBS(NSString *bundleID) {
         @try { bundleID = [request valueForKey:@"bundleIdentifier"]; } @catch (NSException *e2) {}
     }
 
-    // Always call original first — let the app render like the paid version does
     %orig;
 
-    // If it's a target input method, schedule termination after delay
     if (IsAutoCloseBundleID(bundleID)) {
         NSString *capturedBundleID = bundleID;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kAutoCloseDelay * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            BOOL killed = TerminateViaRBS(capturedBundleID);
-            if (!killed) {
-                // Fallback: try via SBApplicationController
-                WriteLog(@"[AUTOCLOSE] RBS terminate failed for %@, trying fallback", capturedBundleID);
-            }
+            DestroySceneForBundleID(capturedBundleID);
         });
     }
 }
