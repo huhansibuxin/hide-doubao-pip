@@ -32,7 +32,7 @@ jobs:
 
       - name: Build
         env:
-          LANG: en_US.UTF-8
+          LC_ALL: C
         run: |
           export THEOS=$HOME/theos
           make clean
