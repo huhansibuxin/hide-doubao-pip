@@ -452,11 +452,12 @@ static BOOL IsDoubaoPiPController(id pipCtrl) {
 //
 // Paid TrollOpen behavior (verified):
 //   Wetype renders briefly, then the popup auto-dismisses.
-//   The process is NOT killed — only the scene is destroyed.
+//   The process is NOT killed — only the popup window disappears.
 //
 // Multi-strategy close (tried in order):
 //   1. UIWindow iteration: find doubao windows → hide (alpha=0, hidden=YES)
-//   2. SBMainWorkspace: externalApplicationSceneHandles → destroyScene
+//   2. FBSceneManager: find doubao scene → invalidate
+//   3. SBMainWorkspace: externalApplicationSceneHandles → destroyScene
 // ============================================================
 
 static const NSTimeInterval kAutoCloseDelay = 2.0;
@@ -467,6 +468,33 @@ static BOOL IsAutoCloseBundleID(NSString *bundleID) {
            [bundleID isEqualToString:@"com.bytedance.ios.doubaoime.keyboard"] ||
            [bundleID isEqualToString:@"com.tencent.wetype"] ||
            [bundleID isEqualToString:@"com.tencent.wetype.keyboard"];
+}
+
+// Extract bundleIdentifier from an FBScene via identity or clientProcess
+static NSString *BundleIDFromFBScene(id scene) {
+    if (!scene) return nil;
+    @try {
+        id identity = [scene valueForKey:@"identity"];
+        if (identity) {
+            NSString *bid = [identity valueForKey:@"bundleIdentifier"];
+            if (bid) return bid;
+            bid = [identity valueForKey:@"_bundleIdentifier"];
+            if (bid) return bid;
+        }
+        id cp = [scene valueForKey:@"clientProcess"];
+        if (cp) {
+            NSString *bid = [cp valueForKey:@"bundleIdentifier"];
+            if (bid) return bid;
+            bid = [cp valueForKey:@"_bundleIdentifier"];
+            if (bid) return bid;
+        }
+        id ci = [scene valueForKey:@"clientIdentity"];
+        if (ci) {
+            NSString *bid = [ci valueForKey:@"bundleIdentifier"];
+            if (bid) return bid;
+        }
+    } @catch (NSException *e) {}
+    return nil;
 }
 
 // Strategy 1: Hide any UIWindow belonging to the target bundle
@@ -481,7 +509,6 @@ static BOOL TryHideWindowsForBundleID(NSString *bundleID) {
             if (window.hidden || window.alpha < 0.01) continue;
 
             @try {
-                // Check windowScene → FBScene for bundleID match
                 id windowScene = [window valueForKey:@"windowScene"];
                 if (!windowScene) windowScene = [window valueForKey:@"_windowScene"];
 
@@ -489,17 +516,14 @@ static BOOL TryHideWindowsForBundleID(NSString *bundleID) {
                     id fbScene = [windowScene valueForKey:@"_scene"];
                     if (!fbScene) fbScene = [windowScene valueForKey:@"scene"];
 
-                    if (fbScene) {
-                        id identity = [fbScene valueForKey:@"identity"];
-                        NSString *winBundleID = [identity valueForKey:@"bundleIdentifier"];
-                        if (![winBundleID isEqualToString:bundleID]) continue;
+                    NSString *winBundleID = BundleIDFromFBScene(fbScene);
+                    if (![winBundleID isEqualToString:bundleID]) continue;
 
-                        WriteLog(@"[AUTOCLOSE] Hiding doubao window ptr=%p class=%@", window, SafeClassName(window));
-                        window.hidden = YES;
-                        window.alpha = 0.0;
-                        window.userInteractionEnabled = NO;
-                        found = YES;
-                    }
+                    WriteLog(@"[AUTOCLOSE] Hiding doubao window ptr=%p class=%@", window, SafeClassName(window));
+                    window.hidden = YES;
+                    window.alpha = 0.0;
+                    window.userInteractionEnabled = NO;
+                    found = YES;
                 }
             } @catch (NSException *e) {}
         }
@@ -508,7 +532,37 @@ static BOOL TryHideWindowsForBundleID(NSString *bundleID) {
     return NO;
 }
 
-// Strategy 2: externalApplicationSceneHandles → destroySceneWithTransitionContext
+// Strategy 2: FBSceneManager → invalidate doubao scene
+static BOOL TryCloseViaFBSceneManager(NSString *bundleID) {
+    @try {
+        Class mgrClass = objc_getClass("FBSceneManager");
+        if (!mgrClass) return NO;
+        id mgr = [mgrClass performSelector:@selector(sharedInstance)];
+        if (!mgr) return NO;
+
+        id scenes = [mgr valueForKey:@"_scenes"];
+        if (!scenes) scenes = [mgr valueForKey:@"scenes"];
+        if (![scenes respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) return NO;
+
+        for (id scene in scenes) {
+            @try {
+                NSString *bid = BundleIDFromFBScene(scene);
+                if (![bid isEqualToString:bundleID]) continue;
+
+                WriteLog(@"[AUTOCLOSE] Found doubao FBScene, invalidating...");
+
+                SEL invalidateSel = NSSelectorFromString(@"invalidate");
+                if ([scene respondsToSelector:invalidateSel]) {
+                    ((void (*)(id, SEL))objc_msgSend)(scene, invalidateSel);
+                    return YES;
+                }
+            } @catch (NSException *e) {}
+        }
+    } @catch (NSException *e) {}
+    return NO;
+}
+
+// Strategy 3: externalApplicationSceneHandles → destroySceneWithTransitionContext
 static BOOL TryDestroySceneForBundleID(NSString *bundleID) {
     @try {
         Class workspaceClass = objc_getClass("SBMainWorkspace");
@@ -545,6 +599,7 @@ static void ClosePopupForBundleID(NSString *bundleID) {
     WriteLog(@"[AUTOCLOSE] Attempting to close popup for bundleID=%@", bundleID);
 
     if (TryHideWindowsForBundleID(bundleID)) return;
+    if (TryCloseViaFBSceneManager(bundleID)) return;
     TryDestroySceneForBundleID(bundleID);
 }
 
