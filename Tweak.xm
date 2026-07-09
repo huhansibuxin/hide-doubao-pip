@@ -604,7 +604,7 @@ static void ClosePopupForBundleID(NSString *bundleID) {
 }
 
 // ============================================================
-// Detection hook: FBScene activation (catches TrollOpen split-screen launches)
+// Detection hooks for TrollOpen split-screen + standard launches
 // ============================================================
 
 static void ScheduleCloseForBundleID(NSString *bundleID) {
@@ -615,21 +615,41 @@ static void ScheduleCloseForBundleID(NSString *bundleID) {
     });
 }
 
-%hook FBScene
+// Hook 1: SBApplication._setFrontmost: — fires for ANY app becoming foreground
+%hook SBApplication
 
-- (void)activateWithTransitionContext:(id)context {
+- (void)_setFrontmost:(BOOL)frontmost {
     %orig;
+    if (!frontmost) return;
 
-    NSString *bid = BundleIDFromFBScene(self);
+    NSString *bid = nil;
+    @try { bid = [self valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
+    if (!bid) @try { bid = [self valueForKey:@"_bundleIdentifier"]; } @catch (NSException *e) {}
+
+    WriteLog(@"[AUTOCLOSE] SBApplication _setFrontmost:YES bundleID=%@", bid ?: @"(nil)");
     if (IsAutoCloseBundleID(bid)) {
-        WriteLog(@"[AUTOCLOSE] FBScene activate detected: %@", bid);
         ScheduleCloseForBundleID(bid);
     }
 }
 
 %end
 
-// Fallback: SBMainWorkspace hook (standard app launch path)
+// Hook 2: FBScene creation — catches TrollOpen scene setup
+%hook FBScene
+
+- (id)initWithIdentifier:(id)sceneID settings:(id)settings clientProvider:(id)provider {
+    id result = %orig;
+    NSString *bid = BundleIDFromFBScene(result);
+    WriteLog(@"[AUTOCLOSE] FBScene init bundleID=%@ sceneID=%@", bid ?: @"(nil)", sceneID);
+    if (IsAutoCloseBundleID(bid)) {
+        ScheduleCloseForBundleID(bid);
+    }
+    return result;
+}
+
+%end
+
+// Hook 3: SBMainWorkspace — standard launch path fallback
 %hook SBMainWorkspace
 
 - (void)_handleOpenApplicationRequest:(id)request options:(id)options activationSettings:(id)settings origin:(id)origin withResult:(id)result {
@@ -653,5 +673,5 @@ static void ScheduleCloseForBundleID(NSString *bundleID) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v0.0.11 - PiP hide + FBScene activation detection + multi-strategy autoclose");
+    WriteLog(@"[INIT] HideDoubaoPiP v0.0.12 - SBApplication + FBScene init detection + multi-strategy autoclose");
 }
