@@ -469,5 +469,5 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.4 - wetype PiP hide + idle timer fix");
+    WriteLog(@"[INIT] HideDoubaoPiP v1.0.5 - wetype PiP hide + idle timer fix");
 }
