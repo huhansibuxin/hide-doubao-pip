@@ -4,10 +4,6 @@
 #import <sys/stat.h>
 #import <time.h>
 
-// ============================================================
-// Part 1: Hide doubao PiP floating window
-// ============================================================
-
 static FILE *logFile = NULL;
 static const NSUInteger kMaxLogSize = 512 * 1024;
 static NSString *const kLogPath = @"/var/mobile/Documents/PiPArrowHide.log";
@@ -47,8 +43,10 @@ static void WriteLog(NSString *format, ...) {
     fflush(logFile);
 }
 
-static BOOL IsDoubaoBundleID(id value) {
-    return [value isKindOfClass:[NSString class]] && [(NSString *)value isEqualToString:@"com.bytedance.ios.doubaoime"];
+static BOOL IsTargetBundleID(id value) {
+    return [value isKindOfClass:[NSString class]] &&
+           ([(NSString *)value isEqualToString:@"com.bytedance.ios.doubaoime"] ||
+            [(NSString *)value isEqualToString:@"com.tencent.wetype"]);
 }
 
 static DoubaoPiPIdentity IdentityFromBundleID(id value) {
@@ -56,7 +54,7 @@ static DoubaoPiPIdentity IdentityFromBundleID(id value) {
 
     NSString *bundleID = (NSString *)value;
     if (bundleID.length == 0) return DoubaoPiPIdentityUnknown;
-    return IsDoubaoBundleID(bundleID) ? DoubaoPiPIdentityDoubao : DoubaoPiPIdentityNonDoubao;
+    return IsTargetBundleID(bundleID) ? DoubaoPiPIdentityDoubao : DoubaoPiPIdentityNonDoubao;
 }
 
 static id SafeKVC(id object, NSString *key) {
@@ -319,6 +317,30 @@ static BOOL StashDoubaoWindow(UIWindow *window) {
     return NO;
 }
 
+// ============================================================
+// Part 1: idle timer fix & hide target PiP
+// ============================================================
+
+static BOOL IsTargetPiPController(id pipCtrl) {
+    return IdentityFromPiPController(pipCtrl) == DoubaoPiPIdentityDoubao;
+}
+
+static void InvalidateIdleTimerForPiPWindow(UIWindow *window) {
+    if (!window) return;
+    UIViewController *rvc = window.rootViewController;
+    if (!rvc) return;
+    id pipCtrl = SafeKVC(rvc, @"_pipController");
+    if (!pipCtrl || !IsTargetPiPController(pipCtrl)) return;
+
+    @try {
+        SEL invalidateSel = NSSelectorFromString(@"invalidateIdleTimerBehaviors");
+        if ([pipCtrl respondsToSelector:invalidateSel]) {
+            ((void (*)(id, SEL))objc_msgSend)(pipCtrl, invalidateSel);
+            WriteLog(@"[IDLE] invalidateIdleTimerBehaviors ptr=%p", pipCtrl);
+        }
+    } @catch (NSException *e) {}
+}
+
 static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     if (!window || !IsVisiblePiPWindow(window)) return;
 
@@ -335,6 +357,7 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
             BOOL stashed = StashDoubaoWindow(w);
             w.alpha = 0.0;
             w.userInteractionEnabled = NO;
+            InvalidateIdleTimerForPiPWindow(w);
             WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d", w, reason, stashed);
         }
         return;
@@ -345,6 +368,7 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     BOOL stashed = StashDoubaoWindow(window);
     window.alpha = 0.0;
     window.userInteractionEnabled = NO;
+    InvalidateIdleTimerForPiPWindow(window);
     WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d", window, reason, stashed);
 }
 
@@ -371,6 +395,7 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 - (void)setAlpha:(CGFloat)alpha {
     if (alpha > 0.01 && IsDoubaoPiPWindowWithRefresh(self, YES)) {
         StashDoubaoWindow(self);
+        InvalidateIdleTimerForPiPWindow(self);
         %orig(0.0);
         self.userInteractionEnabled = NO;
         return;
@@ -423,25 +448,21 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 
 %end
 
-// idle timer hook
-static BOOL IsDoubaoPiPController(id pipCtrl) {
-    return IdentityFromPiPController(pipCtrl) == DoubaoPiPIdentityDoubao;
-}
-
+// idle timer hook: stop target PiP from acquiring sleep lock + release stale assertions
 %hook SBPIPController
 
 - (void)_acquireIdleTimerDisableAssertion {
-    if (IsDoubaoPiPController(self)) return;
+    if (IsTargetPiPController(self)) return;
     %orig;
 }
 
 - (BOOL)preventsIdleTimer {
-    if (IsDoubaoPiPController(self)) return NO;
+    if (IsTargetPiPController(self)) return NO;
     return %orig;
 }
 
 - (BOOL)_preventsIdleTimer {
-    if (IsDoubaoPiPController(self)) return NO;
+    if (IsTargetPiPController(self)) return NO;
     return %orig;
 }
 
@@ -455,8 +476,8 @@ static BOOL IsDoubaoPiPController(id pipCtrl) {
 //   The process is NOT killed — only the popup window disappears.
 //
 // Multi-strategy close (tried in order):
-//   1. UIWindow iteration: find doubao windows → hide (alpha=0, hidden=YES)
-//   2. FBSceneManager: find doubao scene → invalidate
+//   1. UIWindow iteration: find target windows → hide (alpha=0, hidden=YES)
+//   2. FBSceneManager: find target scene → invalidate
 //   3. SBMainWorkspace: externalApplicationSceneHandles → destroyScene
 // ============================================================
 
@@ -519,7 +540,7 @@ static BOOL TryHideWindowsForBundleID(NSString *bundleID) {
                     NSString *winBundleID = BundleIDFromFBScene(fbScene);
                     if (![winBundleID isEqualToString:bundleID]) continue;
 
-                    WriteLog(@"[AUTOCLOSE] Hiding doubao window ptr=%p class=%@", window, SafeClassName(window));
+                    WriteLog(@"[AUTOCLOSE] Hiding target window ptr=%p class=%@", window, SafeClassName(window));
                     window.hidden = YES;
                     window.alpha = 0.0;
                     window.userInteractionEnabled = NO;
@@ -532,7 +553,7 @@ static BOOL TryHideWindowsForBundleID(NSString *bundleID) {
     return NO;
 }
 
-// Strategy 2: FBSceneManager → invalidate doubao scene
+// Strategy 2: FBSceneManager -> invalidate target scene
 static BOOL TryCloseViaFBSceneManager(NSString *bundleID) {
     @try {
         Class mgrClass = objc_getClass("FBSceneManager");
@@ -549,7 +570,7 @@ static BOOL TryCloseViaFBSceneManager(NSString *bundleID) {
                 NSString *bid = BundleIDFromFBScene(scene);
                 if (![bid isEqualToString:bundleID]) continue;
 
-                WriteLog(@"[AUTOCLOSE] Found doubao FBScene, invalidating...");
+                WriteLog(@"[AUTOCLOSE] Found target FBScene, invalidating...");
 
                 SEL invalidateSel = NSSelectorFromString(@"invalidate");
                 if ([scene respondsToSelector:invalidateSel]) {
@@ -562,7 +583,7 @@ static BOOL TryCloseViaFBSceneManager(NSString *bundleID) {
     return NO;
 }
 
-// Strategy 3: externalApplicationSceneHandles → destroySceneWithTransitionContext
+// Strategy 3: externalApplicationSceneHandles -> destroySceneWithTransitionContext
 static BOOL TryDestroySceneForBundleID(NSString *bundleID) {
     @try {
         Class workspaceClass = objc_getClass("SBMainWorkspace");
@@ -615,7 +636,7 @@ static void ScheduleCloseForBundleID(NSString *bundleID) {
     });
 }
 
-// Hook 1: SBApplication._setFrontmost: — fires for ANY app becoming foreground
+// Hook 1: SBApplication._setFrontmost: - fires for ANY app becoming foreground
 %hook SBApplication
 
 - (void)_setFrontmost:(BOOL)frontmost {
@@ -634,7 +655,7 @@ static void ScheduleCloseForBundleID(NSString *bundleID) {
 
 %end
 
-// Hook 2: FBScene creation — catches TrollOpen scene setup
+// Hook 2: FBScene creation - catches TrollOpen scene setup
 %hook FBScene
 
 - (id)initWithIdentifier:(id)sceneID settings:(id)settings clientProvider:(id)provider {
@@ -649,7 +670,7 @@ static void ScheduleCloseForBundleID(NSString *bundleID) {
 
 %end
 
-// Hook 3: SBMainWorkspace — standard launch path fallback
+// Hook 3: SBMainWorkspace - standard launch path fallback
 %hook SBMainWorkspace
 
 - (void)_handleOpenApplicationRequest:(id)request options:(id)options activationSettings:(id)settings origin:(id)origin withResult:(id)result {
@@ -673,5 +694,5 @@ static void ScheduleCloseForBundleID(NSString *bundleID) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v0.0.12 - SBApplication + FBScene init detection + multi-strategy autoclose");
+    WriteLog(@"[INIT] HideDoubaoPiP v1.0.4 - wetype support + idle timer fix + autoclose");
 }
