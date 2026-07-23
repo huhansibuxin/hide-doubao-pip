@@ -644,8 +644,8 @@ static void ScheduleCloseForBundleID(NSString *bundleID) {
     if (!frontmost) return;
 
     NSString *bid = nil;
-    @try { bid = [self valueForKey:@"bundleIdentifier"]; } @catch (NSException *e) {}
-    if (!bid) @try { bid = [self valueForKey:@"_bundleIdentifier"]; } @catch (NSException *e) {}
+    @try { bid = ((id (*)(id, SEL, id))objc_msgSend)(self, @selector(valueForKey:), @"bundleIdentifier"); } @catch (NSException *e) {}
+    if (!bid) @try { bid = ((id (*)(id, SEL, id))objc_msgSend)(self, @selector(valueForKey:), @"_bundleIdentifier"); } @catch (NSException *e) {}
 
     WriteLog(@"[AUTOCLOSE] SBApplication _setFrontmost:YES bundleID=%@", bid ?: @"(nil)");
     if (IsAutoCloseBundleID(bid)) {
