@@ -346,6 +346,11 @@ static void InvalidateIdleTimerForPiPWindow(UIWindow *window) {
 static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     if (!window || !IsVisiblePiPWindow(window)) return;
 
+    if (objc_getAssociatedObject(window, kHiddenByTweakKey)) {
+        WriteLog(@"[WINDOW] Skip ptr=%p reason=%@ (already hidden, system wake)", window, reason);
+        return;
+    }
+
     BOOL forceRefresh = [reason isEqualToString:@"didMoveToWindow"] || [reason isEqualToString:@"setHidden"] || [reason isEqualToString:@"setAlpha"];
     if (HasMultipleActivePiPWindows(window, forceRefresh)) {
 #pragma clang diagnostic push
@@ -399,10 +404,9 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 - (void)setAlpha:(CGFloat)alpha {
     if (alpha > 0.01 && IsDoubaoPiPWindowWithRefresh(self, YES)) {
         if (objc_getAssociatedObject(self, kHiddenByTweakKey)) {
-            /* Already hidden by us before; system is waking it up for PiP swap.
-               Clear the tag and let the alpha pass through so the swap animation
-               works normally (e.g. WeChat video PiP replacing wetype PiP). */
-            objc_setAssociatedObject(self, kHiddenByTweakKey, nil, OBJC_ASSOCIATION_RETAIN);
+            /* Already hidden by us; system is waking this window for PiP swap
+               (e.g. WeChat video PiP replacing wetype PiP via setHidden:NO + setAlpha:).
+               Tag stays on window until dealloc — all subsequent UI calls skip. */
             %orig;
             return;
         }
