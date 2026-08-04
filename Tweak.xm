@@ -17,6 +17,8 @@ typedef NS_ENUM(NSInteger, DoubaoPiPIdentity) {
     DoubaoPiPIdentityNonDoubao,
 };
 
+static const void *kHiddenByTweakKey = &kHiddenByTweakKey;
+
 static void WriteLog(NSString *format, ...) NS_FORMAT_FUNCTION(1,2);
 static void WriteLog(NSString *format, ...) {
     struct stat st;
@@ -354,32 +356,24 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
             if (!IsVisiblePiPWindow(w)) continue;
             if (!IsDoubaoPiPWindow(w)) continue;
 
-            UIWindow *capturedWindow = w;
-            NSString *capturedReason = reason;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (!capturedWindow || !IsVisiblePiPWindow(capturedWindow)) return;
-                BOOL stashed = StashDoubaoWindow(capturedWindow);
-                capturedWindow.alpha = 0.0;
-                capturedWindow.userInteractionEnabled = NO;
-                InvalidateIdleTimerForPiPWindow(capturedWindow);
-                WriteLog(@"[WINDOW] Hidden PiP ptr=%p reason=%@ stashed=%d delayed=1s", capturedWindow, capturedReason, stashed);
-            });
+            BOOL stashed = StashDoubaoWindow(w);
+            w.alpha = 0.0;
+            w.userInteractionEnabled = NO;
+            InvalidateIdleTimerForPiPWindow(w);
+            objc_setAssociatedObject(w, kHiddenByTweakKey, @YES, OBJC_ASSOCIATION_RETAIN);
+            WriteLog(@"[WINDOW] Hidden PiP ptr=%p reason=%@ stashed=%d", w, reason, stashed);
         }
         return;
     }
 
     if (!IsDoubaoPiPWindowWithRefresh(window, forceRefresh)) return;
 
-    UIWindow *capturedWindow = window;
-    NSString *capturedReason = reason;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!capturedWindow || !IsVisiblePiPWindow(capturedWindow)) return;
-        BOOL stashed = StashDoubaoWindow(capturedWindow);
-        capturedWindow.alpha = 0.0;
-        capturedWindow.userInteractionEnabled = NO;
-        InvalidateIdleTimerForPiPWindow(capturedWindow);
-        WriteLog(@"[WINDOW] Hidden PiP ptr=%p reason=%@ stashed=%d delayed=1s", capturedWindow, capturedReason, stashed);
-    });
+    BOOL stashed = StashDoubaoWindow(window);
+    window.alpha = 0.0;
+    window.userInteractionEnabled = NO;
+    InvalidateIdleTimerForPiPWindow(window);
+    objc_setAssociatedObject(window, kHiddenByTweakKey, @YES, OBJC_ASSOCIATION_RETAIN);
+    WriteLog(@"[WINDOW] Hidden PiP ptr=%p reason=%@ stashed=%d", window, reason, stashed);
 }
 
 static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
@@ -404,16 +398,19 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 
 - (void)setAlpha:(CGFloat)alpha {
     if (alpha > 0.01 && IsDoubaoPiPWindowWithRefresh(self, YES)) {
-        %orig;
-        __weak typeof(self) weakSelf = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) return;
-            StashDoubaoWindow(strongSelf);
-            ((void (*)(id, SEL, CGFloat))objc_msgSend)(strongSelf, @selector(setAlpha:), 0.0);
-            strongSelf.userInteractionEnabled = NO;
-            InvalidateIdleTimerForPiPWindow(strongSelf);
-        });
+        if (objc_getAssociatedObject(self, kHiddenByTweakKey)) {
+            /* Already hidden by us before; system is waking it up for PiP swap.
+               Clear the tag and let the alpha pass through so the swap animation
+               works normally (e.g. WeChat video PiP replacing wetype PiP). */
+            objc_setAssociatedObject(self, kHiddenByTweakKey, nil, OBJC_ASSOCIATION_RETAIN);
+            %orig;
+            return;
+        }
+        StashDoubaoWindow(self);
+        InvalidateIdleTimerForPiPWindow(self);
+        objc_setAssociatedObject(self, kHiddenByTweakKey, @YES, OBJC_ASSOCIATION_RETAIN);
+        %orig(0.0);
+        self.userInteractionEnabled = NO;
         return;
     }
     %orig;
@@ -485,5 +482,5 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.6 - PiP hide with 1s delay");
+    WriteLog(@"[INIT] HideDoubaoPiP v1.0.6 - revert delay, immediate hide");
 }
