@@ -17,7 +17,8 @@ typedef NS_ENUM(NSInteger, DoubaoPiPIdentity) {
     DoubaoPiPIdentityNonDoubao,
 };
 
-static const void *kHiddenByTweakKey = &kHiddenByTweakKey;
+static NSTimeInterval sLastHideTime = 0;
+static const NSTimeInterval kSwapGracePeriod = 3.0;
 
 static void WriteLog(NSString *format, ...) NS_FORMAT_FUNCTION(1,2);
 static void WriteLog(NSString *format, ...) {
@@ -346,8 +347,9 @@ static void InvalidateIdleTimerForPiPWindow(UIWindow *window) {
 static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     if (!window || !IsVisiblePiPWindow(window)) return;
 
-    if (objc_getAssociatedObject(window, kHiddenByTweakKey)) {
-        WriteLog(@"[WINDOW] Skip ptr=%p reason=%@ (already hidden, system wake)", window, reason);
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - sLastHideTime < kSwapGracePeriod) {
+        WriteLog(@"[WINDOW] Skip ptr=%p reason=%@ (within %.0fs grace period)", window, reason, now - sLastHideTime);
         return;
     }
 
@@ -365,9 +367,9 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
             w.alpha = 0.0;
             w.userInteractionEnabled = NO;
             InvalidateIdleTimerForPiPWindow(w);
-            objc_setAssociatedObject(w, kHiddenByTweakKey, @YES, OBJC_ASSOCIATION_RETAIN);
             WriteLog(@"[WINDOW] Hidden PiP ptr=%p reason=%@ stashed=%d", w, reason, stashed);
         }
+        sLastHideTime = [NSDate timeIntervalSinceReferenceDate];
         return;
     }
 
@@ -377,8 +379,8 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     window.alpha = 0.0;
     window.userInteractionEnabled = NO;
     InvalidateIdleTimerForPiPWindow(window);
-    objc_setAssociatedObject(window, kHiddenByTweakKey, @YES, OBJC_ASSOCIATION_RETAIN);
     WriteLog(@"[WINDOW] Hidden PiP ptr=%p reason=%@ stashed=%d", window, reason, stashed);
+    sLastHideTime = [NSDate timeIntervalSinceReferenceDate];
 }
 
 static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
@@ -403,18 +405,18 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 
 - (void)setAlpha:(CGFloat)alpha {
     if (alpha > 0.01 && IsDoubaoPiPWindowWithRefresh(self, YES)) {
-        if (objc_getAssociatedObject(self, kHiddenByTweakKey)) {
-            /* Already hidden by us; system is waking this window for PiP swap
-               (e.g. WeChat video PiP replacing wetype PiP via setHidden:NO + setAlpha:).
-               Tag stays on window until dealloc — all subsequent UI calls skip. */
+        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+        if (now - sLastHideTime < kSwapGracePeriod) {
+            /* Within grace period after a recent hide: likely system waking
+               the PiP for swap (e.g. WeChat video PiP replacing wetype). */
             %orig;
             return;
         }
         StashDoubaoWindow(self);
         InvalidateIdleTimerForPiPWindow(self);
-        objc_setAssociatedObject(self, kHiddenByTweakKey, @YES, OBJC_ASSOCIATION_RETAIN);
         %orig(0.0);
         self.userInteractionEnabled = NO;
+        sLastHideTime = [NSDate timeIntervalSinceReferenceDate];
         return;
     }
     %orig;
