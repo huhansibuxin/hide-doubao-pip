@@ -1,12 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <sys/stat.h>
-#import <time.h>
 
-static FILE *logFile = NULL;
-static const NSUInteger kMaxLogSize = 512 * 1024;
-static NSString *const kLogPath = @"/var/mobile/Documents/PiPArrowHide.log";
 static const NSTimeInterval kPiPWindowCountCacheInterval = 0.10;
 static NSTimeInterval sLastPiPWindowCountCheckTime = 0;
 static BOOL sLastHasMultipleActivePiPWindows = NO;
@@ -16,32 +11,6 @@ typedef NS_ENUM(NSInteger, DoubaoPiPIdentity) {
     DoubaoPiPIdentityDoubao,
     DoubaoPiPIdentityNonDoubao,
 };
-
-static void WriteLog(NSString *format, ...) NS_FORMAT_FUNCTION(1,2);
-static void WriteLog(NSString *format, ...) {
-    struct stat st;
-    BOOL shouldResetLog = stat(kLogPath.UTF8String, &st) == 0 && (NSUInteger)st.st_size >= kMaxLogSize;
-    if (logFile && shouldResetLog) {
-        fclose(logFile);
-        logFile = NULL;
-    }
-    if (!logFile) {
-        logFile = fopen(kLogPath.UTF8String, shouldResetLog ? "w" : "a");
-    }
-    if (!logFile) return;
-    va_list args;
-    va_start(args, format);
-    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    time_t rawTime;
-    time(&rawTime);
-    struct tm timeInfo;
-    localtime_r(&rawTime, &timeInfo);
-    char ts[16];
-    strftime(ts, sizeof(ts), "%H:%M:%S", &timeInfo);
-    fprintf(logFile, "[%s] %s\n", ts, msg.UTF8String);
-    fflush(logFile);
-}
 
 static BOOL IsTargetBundleID(id value) {
     return [value isKindOfClass:[NSString class]] &&
@@ -342,7 +311,6 @@ static void InvalidateIdleTimerForPiPWindow(UIWindow *window) {
         SEL invalidateSel = NSSelectorFromString(@"invalidateIdleTimerBehaviors");
         if ([pipCtrl respondsToSelector:invalidateSel]) {
             ((void (*)(id, SEL))objc_msgSend)(pipCtrl, invalidateSel);
-            WriteLog(@"[IDLE] invalidateIdleTimerBehaviors ptr=%p", pipCtrl);
         }
     } @catch (NSException *e) {}
 }
@@ -360,22 +328,20 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
             if (!IsVisiblePiPWindow(w)) continue;
             if (!IsDoubaoPiPWindow(w)) continue;
 
-            BOOL stashed = StashDoubaoWindow(w);
+            StashDoubaoWindow(w);
             w.alpha = 0.0;
             w.userInteractionEnabled = NO;
             InvalidateIdleTimerForPiPWindow(w);
-            WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d", w, reason, stashed);
         }
         return;
     }
 
     if (!IsDoubaoPiPWindowWithRefresh(window, forceRefresh)) return;
 
-    BOOL stashed = StashDoubaoWindow(window);
+    StashDoubaoWindow(window);
     window.alpha = 0.0;
     window.userInteractionEnabled = NO;
     InvalidateIdleTimerForPiPWindow(window);
-    WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d", window, reason, stashed);
 }
 
 static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
@@ -474,6 +440,3 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 
 %end
 
-%ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.13 - base 1.0.5 + 大窗(unstashed)也自动隐藏");
-}
