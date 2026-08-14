@@ -17,9 +17,6 @@ typedef NS_ENUM(NSInteger, DoubaoPiPIdentity) {
     DoubaoPiPIdentityNonDoubao,
 };
 
-static NSTimeInterval sLastHideTime = 0;
-static const NSTimeInterval kSwapGracePeriod = 3.0;
-
 static void WriteLog(NSString *format, ...) NS_FORMAT_FUNCTION(1,2);
 static void WriteLog(NSString *format, ...) {
     struct stat st;
@@ -247,13 +244,27 @@ static BOOL IsDoubaoPiPWindowWithRefresh(UIWindow *window, BOOL forceRefresh) {
     id pipCtrl = SafeKVC(rvc, @"_pipController");
     DoubaoPiPIdentity identity = IdentityFromPiPController(pipCtrl);
 
-    if (!HasMultipleActivePiPWindows(window, forceRefresh)) {
-        if (identity == DoubaoPiPIdentityDoubao) return YES;
-        if (identity == DoubaoPiPIdentityNonDoubao) return NO;
-    } else {
-        return IsLikelyDoubaoPiPWindowByViewTree(window);
+    // Identity (bundle/process) is authoritative. A window whose owning app is
+    // neither Doubao IME nor WeChat input method (e.g. WeChat video
+    // com.tencent.xin, Bilibili, etc.) MUST never be hidden — even when other
+    // PiP windows are on screen at the same time. This is the fix for the bug
+    // where the WeChat video PiP got stashed together with the voice strip.
+    if (identity == DoubaoPiPIdentityDoubao) return YES;
+    if (identity == DoubaoPiPIdentityNonDoubao) return NO;
+
+    // identity == Unknown: the PiP controller has not yet been associated with a
+    // bundle ID (common transient right after a window is created). Do NOT fall
+    // back to the loose view-tree heuristic while other PiP windows coexist — a
+    // freshly-spawned video PiP shares the generic PG* view classes and a ~16:9
+    // aspect ratio (1.78, inside the 1.55~1.95 window), so it would be falsely
+    // matched and hidden. Be conservative: ambiguous + other PiP present => leave it alone.
+    if (HasMultipleActivePiPWindows(window, forceRefresh)) {
+        return NO;
     }
 
+    // Only remaining PiP on screen and bundle still unknown: use the view-tree
+    // fingerprint as a last resort (keeps hiding the Doubao voice strip when its
+    // bundle ID is genuinely empty).
     return IsLikelyDoubaoPiPWindowByViewTree(window);
 }
 
@@ -347,12 +358,6 @@ static void InvalidateIdleTimerForPiPWindow(UIWindow *window) {
 static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     if (!window || !IsVisiblePiPWindow(window)) return;
 
-    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - sLastHideTime < kSwapGracePeriod) {
-        WriteLog(@"[WINDOW] Skip ptr=%p reason=%@ (within %.0fs grace period)", window, reason, now - sLastHideTime);
-        return;
-    }
-
     BOOL forceRefresh = [reason isEqualToString:@"didMoveToWindow"] || [reason isEqualToString:@"setHidden"] || [reason isEqualToString:@"setAlpha"];
     if (HasMultipleActivePiPWindows(window, forceRefresh)) {
 #pragma clang diagnostic push
@@ -367,9 +372,8 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
             w.alpha = 0.0;
             w.userInteractionEnabled = NO;
             InvalidateIdleTimerForPiPWindow(w);
-            WriteLog(@"[WINDOW] Hidden PiP ptr=%p reason=%@ stashed=%d", w, reason, stashed);
+            WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d", w, reason, stashed);
         }
-        sLastHideTime = [NSDate timeIntervalSinceReferenceDate];
         return;
     }
 
@@ -379,8 +383,7 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     window.alpha = 0.0;
     window.userInteractionEnabled = NO;
     InvalidateIdleTimerForPiPWindow(window);
-    WriteLog(@"[WINDOW] Hidden PiP ptr=%p reason=%@ stashed=%d", window, reason, stashed);
-    sLastHideTime = [NSDate timeIntervalSinceReferenceDate];
+    WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d", window, reason, stashed);
 }
 
 static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
@@ -405,18 +408,10 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 
 - (void)setAlpha:(CGFloat)alpha {
     if (alpha > 0.01 && IsDoubaoPiPWindowWithRefresh(self, YES)) {
-        NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-        if (now - sLastHideTime < kSwapGracePeriod) {
-            /* Within grace period after a recent hide: likely system waking
-               the PiP for swap (e.g. WeChat video PiP replacing wetype). */
-            %orig;
-            return;
-        }
         StashDoubaoWindow(self);
         InvalidateIdleTimerForPiPWindow(self);
         %orig(0.0);
         self.userInteractionEnabled = NO;
-        sLastHideTime = [NSDate timeIntervalSinceReferenceDate];
         return;
     }
     %orig;
@@ -488,5 +483,5 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.6 - revert delay, immediate hide");
+    WriteLog(@"[INIT] HideDoubaoPiP v1.0.7 - fix WeChat video PiP mis-hide (identity authoritative)");
 }
