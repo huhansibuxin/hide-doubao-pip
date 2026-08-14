@@ -67,6 +67,10 @@ static DoubaoPiPIdentity IdentityFromBundleID(id value) {
     return IsTargetBundleID(bundleID) ? DoubaoPiPIdentityDoubao : DoubaoPiPIdentityNonDoubao;
 }
 
+// Forward declaration — BundleIDOfWindowOwner below uses SafeKVC, which is
+// defined further down.
+static id SafeKVC(id object, NSString *key);
+
 // The PiP window is created/hosted by SpringBoard but represents content owned by
 // the SOURCE app (WeChat for a video PiP, the IME for the voice strip). The real
 // owning process is reachable through the window's UIScene -> FBScene ->
