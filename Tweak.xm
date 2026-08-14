@@ -167,21 +167,70 @@ static BOOL ViewIsHiddenOrTransparent(UIView *view) {
     return !view || view.hidden || view.alpha < 0.05;
 }
 
+// Recursively scan the layer tree for video playback layers.
+// A real video PiP (WeChat, Bilibili, etc.) will have AVPlayerLayer,
+// AVSampleBufferDisplayLayer, or similar — the voice strip never does.
+static BOOL WindowHasVideoContent(UIWindow *window) {
+    UIView *rootView = window.rootViewController.view;
+    if (!rootView) return NO;
+
+    NSMutableArray<NSString *> *layerNames = [NSMutableArray array];
+    void (^collectLayers)(CALayer *, NSUInteger) = ^(CALayer *layer, NSUInteger depth) {
+        if (depth > 12) return;
+        NSString *cls = SafeClassName(layer);
+        if (cls && cls.length > 0) [layerNames addObject:cls];
+        for (CALayer *sub in layer.sublayers) {
+            collectLayers(sub, depth + 1);
+        }
+    };
+    collectLayers(rootView.layer, 0);
+
+    for (NSString *cls in layerNames) {
+        if ([cls containsString:@"AVPlayerLayer"] ||
+            [cls containsString:@"AVSampleBufferDisplayLayer"] ||
+            [cls containsString:@"AVVideoLayer"] ||
+            [cls containsString:@"AVCaptureVideoPreviewLayer"]) {
+            WriteLog(@"[VIDEO] Found video layer %@ -> NOT voice strip", cls);
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Relaxed size check: covers both the small stashed strip (~200x120) and the
+// large unstached window (~full-width x ~220).  The old tight bounds (160-260 x
+// 90-150) rejected the large (unstashed) voice window shown in screenshot 1.
 static BOOL RectLooksLikeDoubaoPiP(CGRect rect) {
     CGFloat width = CGRectGetWidth(rect);
     CGFloat height = CGRectGetHeight(rect);
-    if (width < 160.0 || width > 260.0 || height < 90.0 || height > 150.0) return NO;
+    // Minimum: even the small strip must be at least this big
+    if (width < 120.0 || height < 60.0) return NO;
+
+    // Maximum: the large unstashed window can be nearly screen-sized
+    if (width > 500.0 || height > 400.0) return NO;
 
     CGFloat aspect = width / MAX(height, 1.0);
-    return aspect > 1.55 && aspect < 1.95;
+    // Voice strips are always landscape-ish (wider than tall)
+    return aspect > 1.2 && aspect < 2.5;
 }
 
 static BOOL IsLikelyDoubaoPiPWindowByViewTree(UIWindow *window) {
     UIView *rootView = window.rootViewController.view;
     if (!rootView) return NO;
 
+    // Hard exclusion: if the window has video playback layers it is a real
+    // video PiP, never the voice strip.
+    if (WindowHasVideoContent(window)) return NO;
+
     UIView *hitTestView = FindViewByClassName(rootView, @"PGHitTestExtendableView", 8);
-    if (!hitTestView || !RectLooksLikeDoubaoPiP(hitTestView.frame)) return NO;
+    if (!hitTestView) return NO;
+
+    // Size check is now a soft signal, not a hard gate — the large unstashed
+    // voice window exceeds the old bounds but still shares the same PG* skeleton.
+    CGRect hitFrame = hitTestView.frame;
+    CGFloat w = CGRectGetWidth(hitFrame);
+    CGFloat h = CGRectGetHeight(hitFrame);
+    if (w < 80.0 || h < 40.0) return NO;  // absurdly small → not our target
 
     UIView *layoutView = FindViewByClassName(rootView, @"PGLayoutContainerView", 8);
     UIView *progressView = FindViewByClassName(rootView, @"PGProgressIndicator", 8);
@@ -256,15 +305,24 @@ static BOOL IsDoubaoPiPWindowWithRefresh(UIWindow *window, BOOL forceRefresh) {
     // bundle ID (common transient right after a window is created). Do NOT fall
     // back to the loose view-tree heuristic while other PiP windows coexist — a
     // freshly-spawned video PiP shares the generic PG* view classes and a ~16:9
-    // aspect ratio (1.78, inside the 1.55~1.95 window), so it would be falsely
+    // aspect ratio (1.78, inside the old 1.55~1.95 window), so it would be falsely
     // matched and hidden. Be conservative: ambiguous + other PiP present => leave it alone.
     if (HasMultipleActivePiPWindows(window, forceRefresh)) {
         return NO;
     }
 
-    // Only remaining PiP on screen and bundle still unknown: use the view-tree
-    // fingerprint as a last resort (keeps hiding the Doubao voice strip when its
-    // bundle ID is genuinely empty).
+    // Single PiP on screen but identity still unknown. Before using the structural
+    // view-tree fingerprint (which can be fooled by any PG*-based PiP), check for
+    // video playback layers. A real video PiP always has AVPlayerLayer or similar;
+    // the voice strip never does.
+    if (WindowHasVideoContent(window)) {
+        WriteLog(@"[IDENTIFY] identity=Unknown but has video layers -> NOT voice strip");
+        return NO;
+    }
+
+    // Only remaining PiP on screen, no video content, bundle still unknown:
+    // use the view-tree fingerprint as a last resort (keeps hiding the Doubao
+    // voice strip when its bundle ID is genuinely empty).
     return IsLikelyDoubaoPiPWindowByViewTree(window);
 }
 
@@ -483,5 +541,5 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.7 - fix WeChat video PiP mis-hide (identity authoritative)");
+    WriteLog(@"[INIT] HideDoubaoPiP v1.0.8 - video layer detection + relaxed size + identity authoritative");
 }
