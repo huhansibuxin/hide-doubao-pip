@@ -67,6 +67,50 @@ static DoubaoPiPIdentity IdentityFromBundleID(id value) {
     return IsTargetBundleID(bundleID) ? DoubaoPiPIdentityDoubao : DoubaoPiPIdentityNonDoubao;
 }
 
+// The PiP window is created/hosted by SpringBoard but represents content owned by
+// the SOURCE app (WeChat for a video PiP, the IME for the voice strip). The real
+// owning process is reachable through the window's UIScene -> FBScene ->
+// clientProcess, which carries the genuine source bundle INDEPENDENTLY of any
+// reused/stale PiP controller. This is the reliable, early differentiator we need
+// — unlike _pipController.bundleID, it does not go stale when SpringBoard recycles
+// a single PiP controller across apps.
+static NSString *BundleIDOfWindowOwner(UIWindow *window) {
+    @try {
+        id ws = SafeKVC(window, @"windowScene");
+        if (ws) {
+            id scene = SafeKVC(ws, @"scene");
+            if (scene) {
+                id client = SafeKVC(scene, @"clientProcess");
+                if (!client) client = SafeKVC(scene, @"_clientProcess");
+                NSString *b = SafeKVC(client, @"bundleIdentifier");
+                if (b) return b;
+                b = SafeKVC(scene, @"boundApplicationBundleIdentifier");
+                if (!b) b = SafeKVC(scene, @"_boundApplicationBundleIdentifier");
+                if (b) return b;
+            }
+        }
+        // Fallback: some windows expose the FBScene directly.
+        id scene2 = SafeKVC(window, @"_scene");
+        if (scene2) {
+            id client = SafeKVC(scene2, @"clientProcess");
+            if (!client) client = SafeKVC(scene2, @"_clientProcess");
+            NSString *b = SafeKVC(client, @"bundleIdentifier");
+            if (b) return b;
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+static DoubaoPiPIdentity IdentityFromWindowOwner(UIWindow *window) {
+    NSString *bundle = BundleIDOfWindowOwner(window);
+    if (!bundle) return DoubaoPiPIdentityUnknown;
+    if (IsTargetBundleID(bundle)) return DoubaoPiPIdentityDoubao;
+    // SpringBoard is the neutral host of PiP windows — treat it as unknown rather
+    // than a definitive non-target, so we fall through to the controller identity.
+    if ([bundle isEqualToString:@"com.apple.springboard"]) return DoubaoPiPIdentityUnknown;
+    return DoubaoPiPIdentityNonDoubao;
+}
+
 static id SafeKVC(id object, NSString *key) {
     if (!object || key.length == 0) return nil;
     @try {
@@ -217,17 +261,8 @@ static BOOL WindowHasVideoContent(UIWindow *window) {
             [cls containsString:@"CAMetalLayer"] ||
             [cls containsString:@"CAEAGLLayer"] ||
             [cls containsString:@"RTCVideo"] ||
-            [cls containsString:@"WebRTC"] ||
-            // Cross-process video: the source app renders in its own process and
-            // SpringBoard only sees a hosted layer shell (CALayerHost on iOS 16,
-            // formerly _UILayerHost / CARemoteLayer). This is the real, reliable
-            // differentiator between a video PiP and the locally-rendered voice
-            // strip — and it survives the stale-reused-controller identity problem.
-            [cls containsString:@"CALayerHost"] ||
-            [cls containsString:@"CARemoteLayer"] ||
-            [cls containsString:@"UILayerHost"] ||
-            [cls containsString:@"CAContext"]) {
-            WriteLog(@"[VIDEO] Found remote/video layer %@ -> NOT voice strip", cls);
+            [cls containsString:@"WebRTC"]) {
+            WriteLog(@"[VIDEO] Found real video layer %@ -> NOT voice strip", cls);
             return YES;
         }
     }
@@ -344,9 +379,11 @@ static void DiagnosePiPWindow(UIWindow *window) {
 
     UIViewController *rvc = window.rootViewController;
     id pipCtrl = SafeKVC(rvc, @"_pipController");
+    NSString *owner = BundleIDOfWindowOwner(window);
     NSMutableString *info = [NSMutableString stringWithFormat:
-        @"[DIAG] ptr=%p rvc=%@ pipCtrl=%@ hasVideo=%d",
-        window, SafeClassName(rvc), SafeClassName(pipCtrl), WindowHasVideoContent(window)];
+        @"[DIAG] ptr=%p rvc=%@ pipCtrl=%@ owner=%@ tag=%ld hasVideo=%d",
+        window, SafeClassName(rvc), SafeClassName(pipCtrl), owner ?: @"<nil>",
+        (long)window.tag, WindowHasVideoContent(window)];
 
     NSArray *keys = @[@"_bundleIDForAppAnimatingPIPStartInBackground",
                       @"_bundleIDForAppRecentlyStoppingPIP",
@@ -365,6 +402,7 @@ static void DiagnosePiPWindow(UIWindow *window) {
     id pegasus = SafeKVC(adapter, @"_pegasusController");
     id pegasusApp = SafeKVC(pegasus, @"_activePictureInPictureApplication");
     if (pegasusApp) [info appendFormat:@" pegasusApp=%@", pegasusApp];
+    if (owner) [info appendFormat:@" OWNER=%@", owner];
     WriteLog(@"%@", info);
 }
 
@@ -401,62 +439,68 @@ static BOOL IsDoubaoPiPWindowWithRefresh(UIWindow *window, BOOL forceRefresh) {
 
     NSString *ptrKey = [NSString stringWithFormat:@"%llu", (unsigned long long)(uintptr_t)window];
 
-    // 1) HARD EXCLUSION FIRST: a window that renders remote-hosted / video content
-    //    can never be the voice strip — regardless of what its (possibly STALE /
-    //    REUSED) PiP controller bundle ID claims. WeChat video PiP shows its frames
-    //    via a CALayerHost (cross-process layer) once the call connects; the voice
-    //    strip renders locally and never has one. This is the reliable differentiator
-    //    that survives the reused-controller identity problem.
+    // 1) Real, locally-rendered video layers (e.g. in-app YouTube PiP) -> never strip.
     if (WindowHasVideoContent(window)) {
         [sAllowlistedWindows addObject:ptrKey];
         return NO;
     }
-
-    // 2) Sticky allowlist / never-hide: once proven video, or given up on after
-    //    defers, keep excluded even if a reused controller later reports a stale
-    //    Doubao bundle.
     if ([sAllowlistedWindows containsObject:ptrKey] || [sNeverHideWindows containsObject:ptrKey]) {
         return NO;
     }
 
-    id pipCtrl = SafeKVC(rvc, @"_pipController");
-    DoubaoPiPIdentity identity = IdentityFromPiPController(pipCtrl);
-
-    // 3) Positive exclusion: a real non-target app (WeChat video, Bilibili, ...)
-    //    MUST never be hidden.
-    if (identity == DoubaoPiPIdentityNonDoubao) {
+    // 2) PRIMARY signal: the window's ACTUAL OWNING process (source app), read from
+    //    the scene/client-process. This carries the REAL bundle (WeChat vs IME)
+    //    independently of any reused/stale PiP controller, and is available early.
+    //    This is what separates a WeChat video PiP from the IME voice strip.
+    DoubaoPiPIdentity ownerIdentity = IdentityFromWindowOwner(window);
+    if (ownerIdentity == DoubaoPiPIdentityNonDoubao) {
         [sAllowlistedWindows addObject:ptrKey];
+        WriteLog(@"[IDENTIFY] ptr=%p owner=%@ -> EXCLUDE (not voice strip)", window, BundleIDOfWindowOwner(window));
         return NO;
     }
-
-    // 4) Positive inclusion: a window whose PiP controller genuinely belongs to
-    //    the IME voice strip -> hide.
-    if (identity == DoubaoPiPIdentityDoubao) {
-        WriteLog(@"[IDENTIFY] ptr=%p identity=Doubao -> HIDE", window);
+    if (ownerIdentity == DoubaoPiPIdentityDoubao) {
+        WriteLog(@"[IDENTIFY] ptr=%p owner=%@ -> HIDE (voice strip)", window, BundleIDOfWindowOwner(window));
         return YES;
     }
 
-    // 5) identity == Unknown: controller not yet associated. A freshly-spawned
-    //    voice strip AND a freshly-spawned video PiP look identical here (shared
-    //    PG* skeleton, no video layer yet, bundle not populated). Do NOT hide on
-    //    first appearance. Defer a re-check so the real bundle / CALayerHost can
-    //    settle, then decide. Cap the deferrals; if still ambiguous, give up
-    //    (never hide) —宁可漏掉语音小窗，也绝不误杀视频悬浮窗.
-    DiagnosePiPWindow(window);
+    // 3) owner Unknown (scene not populated yet). Fall back to the controller
+    //    identity, then defer and re-check so the owner/controller can settle.
+    id pipCtrl = SafeKVC(rvc, @"_pipController");
+    DoubaoPiPIdentity ctrlIdentity = IdentityFromPiPController(pipCtrl);
 
-    NSNumber *c = sDeferCount[ptrKey];
-    NSInteger count = c ? c.integerValue : 0;
-    if (count >= 2) {
-        // Gave up after defers. If it truly matches the voice-strip shape, hide
-        // it (assume voice strip); otherwise leave it alone.
+    if (ctrlIdentity == DoubaoPiPIdentityNonDoubao) {
+        [sAllowlistedWindows addObject:ptrKey];
+        return NO;
+    }
+    if (ctrlIdentity == DoubaoPiPIdentityDoubao) {
+        // Controller claims IME but owner is unknown — this is precisely the
+        // stale-reused-controller-on-video case. Do NOT hide on first appearance;
+        // defer and re-check the owner (real source app) after it settles.
+        DiagnosePiPWindow(window);
+        NSNumber *c = sDeferCount[ptrKey];
+        NSInteger count = c ? c.integerValue : 0;
+        if (count >= 2) {
+            [sNeverHideWindows addObject:ptrKey];
+            WriteLog(@"[IDENTIFY] ptr=%p ctrl=Doubao owner=Unknown after defers -> EXCLUDE (protect video)", window);
+            return NO;
+        }
+        ScheduleDeferredVerification(window);
+        return NO;
+    }
+
+    // 4) both Unknown: defer + re-check; cap at 2; if still ambiguous, give up
+    //    (never hide) rather than stash a video PiP.
+    DiagnosePiPWindow(window);
+    NSNumber *c2 = sDeferCount[ptrKey];
+    NSInteger count2 = c2 ? c2.integerValue : 0;
+    if (count2 >= 2) {
         [sNeverHideWindows addObject:ptrKey];
         if (IsLikelyDoubaoPiPWindowByViewTree(window)) {
-            WriteLog(@"[IDENTIFY] ptr=%p identity=Unknown after defers, viewTree=YES -> HIDE (voice-strip assumption)", window);
+            WriteLog(@"[IDENTIFY] ptr=%p both-Unknown after defers, viewTree=YES -> HIDE", window);
             return YES;
         }
         return NO;
     }
-
     ScheduleDeferredVerification(window);
     return NO;
 }
@@ -565,7 +609,7 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
             w.alpha = 0.0;
             w.userInteractionEnabled = NO;
             InvalidateIdleTimerForPiPWindow(w);
-            WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d", w, reason, stashed);
+            WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d owner=%@", w, reason, stashed, BundleIDOfWindowOwner(w));
         }
         return;
     }
@@ -576,7 +620,7 @@ static void HideDoubaoWindow(UIWindow *window, NSString *reason) {
     window.alpha = 0.0;
     window.userInteractionEnabled = NO;
     InvalidateIdleTimerForPiPWindow(window);
-    WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d", window, reason, stashed);
+    WriteLog(@"[WINDOW] Hidden Doubao PiP ptr=%p reason=%@ stashed=%d owner=%@", window, reason, stashed, BundleIDOfWindowOwner(window));
 }
 
 static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
@@ -681,5 +725,5 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
     sScheduledDefers = [NSMutableSet set];
     sDeferCount = [NSMutableDictionary dictionary];
     sDiagnosedPtrs = [NSMutableSet set];
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.10 - CALayerHost detect + defer Unknown (never hide video on first appearance)");
+    WriteLog(@"[INIT] HideDoubaoPiP v1.0.11 - window owner (scene/clientProcess) is primary signal");
 }
