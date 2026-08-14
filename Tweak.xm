@@ -170,21 +170,23 @@ static BOOL ViewIsHiddenOrTransparent(UIView *view) {
 // Recursively scan the layer tree for video playback layers.
 // A real video PiP (WeChat, Bilibili, etc.) will have AVPlayerLayer,
 // AVSampleBufferDisplayLayer, or similar — the voice strip never does.
+// Implemented as a plain C function (not a recursive block) to avoid
+// -Werror,-Wuninitialized and -Werror,-Warc-retain-cycles.
+static void CollectVideoLayerNames(CALayer *layer, NSUInteger depth, NSMutableArray<NSString *> *layerNames) {
+    if (!layer || depth > 12) return;
+    NSString *cls = SafeClassName(layer);
+    if (cls && cls.length > 0) [layerNames addObject:cls];
+    for (CALayer *sub in layer.sublayers) {
+        CollectVideoLayerNames(sub, depth + 1, layerNames);
+    }
+}
+
 static BOOL WindowHasVideoContent(UIWindow *window) {
     UIView *rootView = window.rootViewController.view;
     if (!rootView) return NO;
 
     NSMutableArray<NSString *> *layerNames = [NSMutableArray array];
-    __block void (^collectLayers)(CALayer *, NSUInteger);
-    collectLayers = ^(CALayer *layer, NSUInteger depth) {
-        if (depth > 12) return;
-        NSString *cls = SafeClassName(layer);
-        if (cls && cls.length > 0) [layerNames addObject:cls];
-        for (CALayer *sub in layer.sublayers) {
-            collectLayers(sub, depth + 1);
-        }
-    };
-    collectLayers(rootView.layer, 0);
+    CollectVideoLayerNames(rootView.layer, 0, layerNames);
 
     for (NSString *cls in layerNames) {
         if ([cls containsString:@"AVPlayerLayer"] ||
