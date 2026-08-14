@@ -192,11 +192,28 @@ static BOOL WindowHasVideoContent(UIWindow *window) {
         if ([cls containsString:@"AVPlayerLayer"] ||
             [cls containsString:@"AVSampleBufferDisplayLayer"] ||
             [cls containsString:@"AVVideoLayer"] ||
-            [cls containsString:@"AVCaptureVideoPreviewLayer"]) {
+            [cls containsString:@"AVCaptureVideoPreviewLayer"] ||
+            [cls containsString:@"CAMetalLayer"] ||
+            [cls containsString:@"CAEAGLLayer"] ||
+            [cls containsString:@"RTCVideo"] ||
+            [cls containsString:@"WebRTC"]) {
             WriteLog(@"[VIDEO] Found video layer %@ -> NOT voice strip", cls);
             return YES;
         }
     }
+
+    // Debug: surface layer names that hint at video / remote-hosted content so
+    // we can refine detection if a real video PiP still slips through.
+    for (NSString *cls in layerNames) {
+        if ([cls containsString:@"Video"] || [cls containsString:@"Player"] ||
+            [cls containsString:@"Remote"] || [cls containsString:@"Host"] ||
+            [cls containsString:@"Metal"] || [cls containsString:@"Context"] ||
+            [cls containsString:@"Sample"] || [cls containsString:@"Capture"] ||
+            [cls containsString:@"Preview"] || [cls containsString:@"EAGL"]) {
+            WriteLog(@"[VIDEO-DEBUG] layer %@ present", cls);
+        }
+    }
+
     return NO;
 }
 
@@ -276,40 +293,44 @@ static BOOL IsDoubaoPiPWindowWithRefresh(UIWindow *window, BOOL forceRefresh) {
     UIViewController *rvc = window.rootViewController;
     if (!rvc) return NO;
 
+    // HARD EXCLUSION FIRST: a window that actually renders video can never be
+    // the voice strip — regardless of what its (possibly STALE / REUSED) PiP
+    // controller bundle ID claims. When SpringBoard reuses a single PiP
+    // controller across apps, the Doubao bundle ID can linger on the WeChat
+    // video window during the swap, so identity alone is NOT trustworthy here.
+    // This is why v1.0.8 still hid WeChat video: identity came back Doubao from
+    // the reused controller and the hide fired before any video check ran.
+    if (WindowHasVideoContent(window)) {
+        WriteLog(@"[IDENTIFY] ptr=%p has video layers -> NOT voice strip (skip hide)", window);
+        return NO;
+    }
+
     id pipCtrl = SafeKVC(rvc, @"_pipController");
     DoubaoPiPIdentity identity = IdentityFromPiPController(pipCtrl);
 
-    // Identity (bundle/process) is authoritative. A window whose owning app is
-    // neither Doubao IME nor WeChat input method (e.g. WeChat video
-    // com.tencent.xin, Bilibili, etc.) MUST never be hidden — even when other
-    // PiP windows are on screen at the same time. This is the fix for the bug
-    // where the WeChat video PiP got stashed together with the voice strip.
-    if (identity == DoubaoPiPIdentityDoubao) return YES;
-    if (identity == DoubaoPiPIdentityNonDoubao) return NO;
+    if (identity == DoubaoPiPIdentityDoubao) {
+        WriteLog(@"[IDENTIFY] ptr=%p identity=Doubao -> HIDE", window);
+        return YES;
+    }
+    if (identity == DoubaoPiPIdentityNonDoubao) {
+        return NO;
+    }
 
-    // identity == Unknown: the PiP controller has not yet been associated with a
-    // bundle ID (common transient right after a window is created). Do NOT fall
-    // back to the loose view-tree heuristic while other PiP windows coexist — a
-    // freshly-spawned video PiP shares the generic PG* view classes and a ~16:9
-    // aspect ratio (1.78, inside the old 1.55~1.95 window), so it would be falsely
-    // matched and hidden. Be conservative: ambiguous + other PiP present => leave it alone.
+    // identity == Unknown: PiP controller not yet associated with a bundle ID
+    // (transient right after a window is created, or during a controller swap).
+    // Don't hide while other PiP windows coexist — conservatively leave it.
     if (HasMultipleActivePiPWindows(window, forceRefresh)) {
         return NO;
     }
 
-    // Single PiP on screen but identity still unknown. Before using the structural
-    // view-tree fingerprint (which can be fooled by any PG*-based PiP), check for
-    // video playback layers. A real video PiP always has AVPlayerLayer or similar;
-    // the voice strip never does.
-    if (WindowHasVideoContent(window)) {
-        WriteLog(@"[IDENTIFY] identity=Unknown but has video layers -> NOT voice strip");
-        return NO;
+    // Single PiP, no video content, bundle still unknown: use the structural
+    // view-tree fingerprint as a last resort (keeps hiding the Doubao voice
+    // strip when its bundle ID is genuinely empty).
+    BOOL viewTree = IsLikelyDoubaoPiPWindowByViewTree(window);
+    if (viewTree) {
+        WriteLog(@"[IDENTIFY] ptr=%p identity=Unknown viewTree=YES -> HIDE", window);
     }
-
-    // Only remaining PiP on screen, no video content, bundle still unknown:
-    // use the view-tree fingerprint as a last resort (keeps hiding the Doubao
-    // voice strip when its bundle ID is genuinely empty).
-    return IsLikelyDoubaoPiPWindowByViewTree(window);
+    return viewTree;
 }
 
 static BOOL IsDoubaoPiPWindow(UIWindow *window) {
@@ -527,5 +548,5 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
 %end
 
 %ctor {
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.8 - video layer detection + relaxed size + identity authoritative");
+    WriteLog(@"[INIT] HideDoubaoPiP v1.0.9 - video check BEFORE identity (fix stale reused controller)");
 }
