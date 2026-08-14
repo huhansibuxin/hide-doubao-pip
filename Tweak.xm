@@ -175,7 +175,8 @@ static BOOL WindowHasVideoContent(UIWindow *window) {
     if (!rootView) return NO;
 
     NSMutableArray<NSString *> *layerNames = [NSMutableArray array];
-    void (^collectLayers)(CALayer *, NSUInteger) = ^(CALayer *layer, NSUInteger depth) {
+    __block void (^collectLayers)(CALayer *, NSUInteger);
+    collectLayers = ^(CALayer *layer, NSUInteger depth) {
         if (depth > 12) return;
         NSString *cls = SafeClassName(layer);
         if (cls && cls.length > 0) [layerNames addObject:cls];
