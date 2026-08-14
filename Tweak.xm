@@ -200,23 +200,6 @@ static BOOL WindowHasVideoContent(UIWindow *window) {
     return NO;
 }
 
-// Relaxed size check: covers both the small stashed strip (~200x120) and the
-// large unstached window (~full-width x ~220).  The old tight bounds (160-260 x
-// 90-150) rejected the large (unstashed) voice window shown in screenshot 1.
-static BOOL RectLooksLikeDoubaoPiP(CGRect rect) {
-    CGFloat width = CGRectGetWidth(rect);
-    CGFloat height = CGRectGetHeight(rect);
-    // Minimum: even the small strip must be at least this big
-    if (width < 120.0 || height < 60.0) return NO;
-
-    // Maximum: the large unstashed window can be nearly screen-sized
-    if (width > 500.0 || height > 400.0) return NO;
-
-    CGFloat aspect = width / MAX(height, 1.0);
-    // Voice strips are always landscape-ish (wider than tall)
-    return aspect > 1.2 && aspect < 2.5;
-}
-
 static BOOL IsLikelyDoubaoPiPWindowByViewTree(UIWindow *window) {
     UIView *rootView = window.rootViewController.view;
     if (!rootView) return NO;
