@@ -1,6 +1,6 @@
 Package: ayao.hidedoubaopip
 Name: HideDoubaoPiP
-Version: 1.0.12
+Version: 1.0.13
 Architecture: iphoneos-arm64
 Description: 隐藏豆包/微信输入法画中画悬浮窗。保留正常视频画中画功能。
 Maintainer: ayao
