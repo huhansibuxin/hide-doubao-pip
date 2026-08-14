@@ -266,20 +266,7 @@ static BOOL WindowHasVideoContent(UIWindow *window) {
             [cls containsString:@"CAEAGLLayer"] ||
             [cls containsString:@"RTCVideo"] ||
             [cls containsString:@"WebRTC"]) {
-            WriteLog(@"[VIDEO] Found real video layer %@ -> NOT voice strip", cls);
             return YES;
-        }
-    }
-
-    // Debug: surface layer names that hint at video / remote-hosted content so
-    // we can refine detection if a real video PiP still slips through.
-    for (NSString *cls in layerNames) {
-        if ([cls containsString:@"Video"] || [cls containsString:@"Player"] ||
-            [cls containsString:@"Remote"] || [cls containsString:@"Host"] ||
-            [cls containsString:@"Metal"] || [cls containsString:@"Context"] ||
-            [cls containsString:@"Sample"] || [cls containsString:@"Capture"] ||
-            [cls containsString:@"Preview"] || [cls containsString:@"EAGL"]) {
-            WriteLog(@"[VIDEO-DEBUG] layer %@ present", cls);
         }
     }
 
@@ -372,9 +359,75 @@ static UIWindow *FindLivePiPWindowByPointer(uintptr_t p) {
     return nil;
 }
 
-// One-time diagnostic dump of every source-app handle we can reach, so we can
-// pinpoint the exact field that exposes WeChat's bundle (vs the IME's) if a
-// video PiP still slips through. Only logged once per window pointer.
+// Recursively collect unique SpringBoard-rendered subview class names.
+static void CollectViewClassNames(UIView *view, NSUInteger depth, NSMutableSet<NSString *> *classNames) {
+    if (!view || depth > 20) return;
+    NSString *cls = SafeClassName(view);
+    if (cls) [classNames addObject:cls];
+    for (UIView *sub in view.subviews) {
+        CollectViewClassNames(sub, depth + 1, classNames);
+    }
+}
+
+// Voice/dictation chrome keywords. The IME voice strip renders dictation UI
+// (mic, waveform, keyboard, language) in SpringBoard-local chrome; a video PiP
+// never contains these. Used as the PRIMARY hide signal so a video PiP is never
+// stashed just because its PiP controller still carries a stale IME bundle.
+static BOOL WindowHasVoiceChrome(UIWindow *window) {
+    UIView *rootView = window.rootViewController.view;
+    if (!rootView) return NO;
+    NSMutableSet<NSString *> *classNames = [NSMutableSet set];
+    CollectViewClassNames(rootView, 0, classNames);
+    NSArray<NSString *> *voiceKeywords = @[
+        @"Dictation", @"Voice", @"Waveform", @"Wavy", @"Mic", @"Speech",
+        @"Siri", @"Dictate", @"Transcribe", @"AudioInput", @"Talk"
+    ];
+    for (NSString *cls in classNames) {
+        for (NSString *kw in voiceKeywords) {
+            if ([cls containsString:kw]) return YES;
+        }
+    }
+    return NO;
+}
+
+// Recursively collect unique layer class names + capture CALayerHost/CARemoteLayer
+// contextIds (the cross-process video/IME content handle — its contextId maps to
+// the source app's CAContext, the real owner we are hunting for).
+static void CollectLayerNamesForDiag(CALayer *layer, NSUInteger depth, NSMutableSet<NSString *> *layerNames, NSMutableArray<NSString *> *ctxIds) {
+    if (!layer || depth > 14) return;
+    NSString *cls = SafeClassName(layer);
+    if (cls) [layerNames addObject:cls];
+    if ([cls isEqualToString:@"CALayerHost"] || [cls isEqualToString:@"CARemoteLayer"] || [cls isEqualToString:@"_UILayerHost"]) {
+        id cid = SafeKVC(layer, @"contextId");
+        if (cid) [ctxIds addObject:[NSString stringWithFormat:@"%@:%@", cls, cid]];
+    }
+    for (CALayer *sub in layer.sublayers) {
+        CollectLayerNamesForDiag(sub, depth + 1, layerNames, ctxIds);
+    }
+}
+
+// Enumerate every KVC-visible property (best-effort) of an object — used by the
+// diagnostic to discover the real owner/process field names. Capped to stay small.
+static NSString *EnumerateKeys(id object) {
+    if (!object) return @"<nil>";
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    unsigned int count = 0;
+    objc_property_t *props = class_copyPropertyList(object_getClass(object), &count);
+    for (unsigned int i = 0; i < count && parts.count < 40; i++) {
+        NSString *name = [NSString stringWithUTF8String:property_getName(props[i])];
+        @try {
+            id v = [object valueForKey:name];
+            if (v) [parts addObject:[NSString stringWithFormat:@"%@=%@", name, v]];
+        } @catch (NSException *e) {}
+    }
+    free(props);
+    if (parts.count == 0) return [NSString stringWithFormat:@"<no-props:%@>", SafeClassName(object)];
+    return [parts componentsJoinedByString:@"; "];
+}
+
+// Comprehensive one-time dump of everything reachable about a PiP window, so we can
+// pinpoint the exact field exposing the REAL owning app (WeChat vs IME) and the
+// view/layer classes that differ between the voice strip and a video PiP.
 static void DiagnosePiPWindow(UIWindow *window) {
     uintptr_t p = (uintptr_t)window;
     NSString *key = [NSString stringWithFormat:@"%llu", (unsigned long long)p];
@@ -383,30 +436,38 @@ static void DiagnosePiPWindow(UIWindow *window) {
 
     UIViewController *rvc = window.rootViewController;
     id pipCtrl = SafeKVC(rvc, @"_pipController");
-    NSString *owner = BundleIDOfWindowOwner(window);
-    NSMutableString *info = [NSMutableString stringWithFormat:
-        @"[DIAG] ptr=%p rvc=%@ pipCtrl=%@ owner=%@ tag=%ld hasVideo=%d",
-        window, SafeClassName(rvc), SafeClassName(pipCtrl), owner ?: @"<nil>",
-        (long)window.tag, WindowHasVideoContent(window)];
+    id ws = SafeKVC(window, @"windowScene");
+    id scene = ws ? SafeKVC(ws, @"scene") : nil;
+    id client = scene ? SafeKVC(scene, @"clientProcess") : nil;
+    if (!client) client = scene ? SafeKVC(scene, @"_clientProcess") : nil;
 
-    NSArray *keys = @[@"_bundleIDForAppAnimatingPIPStartInBackground",
-                      @"_bundleIDForAppRecentlyStoppingPIP",
-                      @"_pipProcess", @"_applicationProcess", @"_application", @"_pipApplication"];
-    for (NSString *k in keys) {
-        id v = SafeKVC(pipCtrl, k);
-        if (v) [info appendFormat:@" %@=%@", k, v];
-    }
-    id cv = SafeKVC(pipCtrl, @"_contentViewController");
-    if (cv) {
-        [info appendFormat:@" cvClass=%@", SafeClassName(cv)];
-        id cvApp = SafeKVC(cv, @"_application");
-        if (cvApp) [info appendFormat:@" cvApp=%@", cvApp];
-    }
-    id adapter = SafeKVC(pipCtrl, @"_adapter");
-    id pegasus = SafeKVC(adapter, @"_pegasusController");
-    id pegasusApp = SafeKVC(pegasus, @"_activePictureInPictureApplication");
-    if (pegasusApp) [info appendFormat:@" pegasusApp=%@", pegasusApp];
-    if (owner) [info appendFormat:@" OWNER=%@", owner];
+    NSMutableString *info = [NSMutableString string];
+    [info appendFormat:@"\n[DIAG-START] ptr=%p\n", window];
+    [info appendFormat:@"  windowClass=%@ rvcClass=%@ pipCtrlClass=%@ tag=%ld\n",
+        SafeClassName(window), SafeClassName(rvc), SafeClassName(pipCtrl), (long)window.tag];
+    [info appendFormat:@"  windowSceneClass=%@ sceneClass=%@ clientProcessClass=%@\n",
+        SafeClassName(ws), SafeClassName(scene), SafeClassName(client)];
+    [info appendFormat:@"  client.bundleIdentifier=%@ client.bundleID=%@ client.pid=%@\n",
+        SafeKVC(client, @"bundleIdentifier"), SafeKVC(client, @"bundleID"), SafeKVC(client, @"pid")];
+    [info appendFormat:@"  client.props=%@\n", EnumerateKeys(client)];
+    [info appendFormat:@"  scene.props=%@\n", EnumerateKeys(scene)];
+    [info appendFormat:@"  pipCtrl.props=%@\n", EnumerateKeys(pipCtrl)];
+
+    UIView *rootView = rvc.view;
+    NSMutableSet<NSString *> *viewClasses = [NSMutableSet set];
+    if (rootView) CollectViewClassNames(rootView, 0, viewClasses);
+    NSArray *sortedViews = [[viewClasses allObjects] sortedArrayUsingSelector:@selector(compare:)];
+    [info appendFormat:@"  viewClasses(%lu)=%@\n", (unsigned long)sortedViews.count, sortedViews];
+
+    NSMutableSet<NSString *> *layerClasses = [NSMutableSet set];
+    NSMutableArray<NSString *> *ctxIds = [NSMutableArray array];
+    if (rootView) CollectLayerNamesForDiag(rootView.layer, 0, layerClasses, ctxIds);
+    NSArray *sortedLayers = [[layerClasses allObjects] sortedArrayUsingSelector:@selector(compare:)];
+    [info appendFormat:@"  layerClasses(%lu)=%@\n", (unsigned long)sortedLayers.count, sortedLayers];
+    [info appendFormat:@"  layerHostContextIds=%@\n", ctxIds];
+    [info appendFormat:@"  hasVideoContent=%d hasVoiceChrome=%d viewTreeSignal=%d\n",
+        WindowHasVideoContent(window), WindowHasVoiceChrome(window), IsLikelyDoubaoPiPWindowByViewTree(window)];
+    [info appendFormat:@"[DIAG-END] ptr=%p\n", window];
     WriteLog(@"%@", info);
 }
 
@@ -443,7 +504,11 @@ static BOOL IsDoubaoPiPWindowWithRefresh(UIWindow *window, BOOL forceRefresh) {
 
     NSString *ptrKey = [NSString stringWithFormat:@"%llu", (unsigned long long)(uintptr_t)window];
 
-    // 1) Real, locally-rendered video layers (e.g. in-app YouTube PiP) -> never strip.
+    // 0) Dump everything once so we can build the final discriminator from real data.
+    DiagnosePiPWindow(window);
+
+    // 1) Real video playback layers (AVPlayerLayer, etc.) -> never strip, even on
+    //    first appearance. This already excludes most genuine video PiPs.
     if (WindowHasVideoContent(window)) {
         [sAllowlistedWindows addObject:ptrKey];
         return NO;
@@ -452,57 +517,46 @@ static BOOL IsDoubaoPiPWindowWithRefresh(UIWindow *window, BOOL forceRefresh) {
         return NO;
     }
 
-    // 2) PRIMARY signal: the window's ACTUAL OWNING process (source app), read from
-    //    the scene/client-process. This carries the REAL bundle (WeChat vs IME)
-    //    independently of any reused/stale PiP controller, and is available early.
-    //    This is what separates a WeChat video PiP from the IME voice strip.
-    DoubaoPiPIdentity ownerIdentity = IdentityFromWindowOwner(window);
-    if (ownerIdentity == DoubaoPiPIdentityNonDoubao) {
-        [sAllowlistedWindows addObject:ptrKey];
-        WriteLog(@"[IDENTIFY] ptr=%p owner=%@ -> EXCLUDE (not voice strip)", window, BundleIDOfWindowOwner(window));
-        return NO;
-    }
-    if (ownerIdentity == DoubaoPiPIdentityDoubao) {
-        WriteLog(@"[IDENTIFY] ptr=%p owner=%@ -> HIDE (voice strip)", window, BundleIDOfWindowOwner(window));
-        return YES;
-    }
-
-    // 3) owner Unknown (scene not populated yet). Fall back to the controller
-    //    identity, then defer and re-check so the owner/controller can settle.
+    // 2) A real NON-IME controller (WeChat…) means a genuine video PiP -> never hide.
+    //    (On first appearance the controller may still carry a stale IME bundle, so
+    //    this only catches the settled case; step 4 covers the ambiguous one.)
     id pipCtrl = SafeKVC(rvc, @"_pipController");
     DoubaoPiPIdentity ctrlIdentity = IdentityFromPiPController(pipCtrl);
-
     if (ctrlIdentity == DoubaoPiPIdentityNonDoubao) {
         [sAllowlistedWindows addObject:ptrKey];
         return NO;
     }
-    if (ctrlIdentity == DoubaoPiPIdentityDoubao) {
-        // Controller claims IME but owner is unknown — this is precisely the
-        // stale-reused-controller-on-video case. Do NOT hide on first appearance;
-        // defer and re-check the owner (real source app) after it settles.
-        DiagnosePiPWindow(window);
-        NSNumber *c = sDeferCount[ptrKey];
-        NSInteger count = c ? c.integerValue : 0;
-        if (count >= 2) {
-            [sNeverHideWindows addObject:ptrKey];
-            WriteLog(@"[IDENTIFY] ptr=%p ctrl=Doubao owner=Unknown after defers -> EXCLUDE (protect video)", window);
-            return NO;
-        }
-        ScheduleDeferredVerification(window);
+
+    // 3) Window owner (source app) if reachable through the scene/client-process.
+    DoubaoPiPIdentity ownerIdentity = IdentityFromWindowOwner(window);
+    if (ownerIdentity == DoubaoPiPIdentityNonDoubao) {
+        [sAllowlistedWindows addObject:ptrKey];
         return NO;
     }
 
-    // 4) both Unknown: defer + re-check; cap at 2; if still ambiguous, give up
-    //    (never hide) rather than stash a video PiP.
-    DiagnosePiPWindow(window);
-    NSNumber *c2 = sDeferCount[ptrKey];
-    NSInteger count2 = c2 ? c2.integerValue : 0;
-    if (count2 >= 2) {
+    // 4) PRIMARY hide signal: dictation/voice chrome present in SpringBoard's own
+    //    view tree. A video PiP never contains these classes, and the chrome is
+    //    created synchronously with the window, so this works on FIRST appearance
+    //    (no timing dependence on the remote video layer or a stale controller).
+    if (WindowHasVoiceChrome(window)) {
+        WriteLog(@"[IDENTIFY] ptr=%p voiceChrome -> HIDE (voice strip)", window);
+        return YES;
+    }
+
+    // 5) Both identities inconclusive AND no voice chrome. Do NOT hide on first
+    //    appearance. Defer + re-check: the controller/owner may settle, the voice
+    //    chrome may appear, or a video layer may attach. Cap at 2 re-checks; if
+    //    still ambiguous, give up (never hide) so a video PiP is never stashed.
+    if (ownerIdentity == DoubaoPiPIdentityDoubao) {
+        WriteLog(@"[IDENTIFY] ptr=%p owner=Doubao but no voiceChrome -> DEFER (suspect stale video)", window);
+    } else {
+        WriteLog(@"[IDENTIFY] ptr=%p owner=Unknown no voiceChrome -> DEFER", window);
+    }
+    NSNumber *c = sDeferCount[ptrKey];
+    NSInteger count = c ? c.integerValue : 0;
+    if (count >= 2) {
         [sNeverHideWindows addObject:ptrKey];
-        if (IsLikelyDoubaoPiPWindowByViewTree(window)) {
-            WriteLog(@"[IDENTIFY] ptr=%p both-Unknown after defers, viewTree=YES -> HIDE", window);
-            return YES;
-        }
+        WriteLog(@"[IDENTIFY] ptr=%p no-signal after defers -> EXCLUDE (protect video)", window);
         return NO;
     }
     ScheduleDeferredVerification(window);
@@ -729,5 +783,5 @@ static void HideDoubaoWindowForView(UIView *view, NSString *reason) {
     sScheduledDefers = [NSMutableSet set];
     sDeferCount = [NSMutableDictionary dictionary];
     sDiagnosedPtrs = [NSMutableSet set];
-    WriteLog(@"[INIT] HideDoubaoPiP v1.0.11 - window owner (scene/clientProcess) is primary signal");
+    WriteLog(@"[INIT] HideDoubaoPiP v1.0.12 - voice-chrome primary signal + full introspection diag");
 }
